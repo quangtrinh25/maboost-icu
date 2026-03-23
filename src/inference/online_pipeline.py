@@ -18,6 +18,15 @@ Bugs fixed vs. original
 3. load() drops Platt scaling and isotonic calibration
    → mort_meta.pkl / los_meta.pkl not loaded, so predictions are
      uncalibrated sigmoid scores instead of Platt-corrected probabilities.
+
+4. predict() used enc(xt, tt) returning z_T (d_model-dim) instead of
+   extract_features() returning [z_multi; raw_stats] (4*d+5*F dim).
+   XGBoost was trained on 1010-dim features but received 170-dim at
+   inference — causing crash or silent garbage predictions.
+
+5. Leaf Refresh used num_boost_round=n_trees (re-processes all trees
+   n_trees times) instead of num_boost_round=1 (one pass through all
+   existing trees). Previous value was ~800x too expensive.
 """
 from __future__ import annotations
 from collections import deque
@@ -74,6 +83,14 @@ class MaBoostOnlinePipeline:
     # ------------------------------------------------------------------
     def predict(self, stay_id: str, x_new: np.ndarray,
                 tau_new: float, x_static: np.ndarray) -> Dict:
+        """
+        FIX 4: dùng extract_features() thay vì enc() để lấy đúng
+        feature vector [z_multi(4*d); raw_stats(5*F)] khớp với
+        feature vector mà XGBoost được train.
+
+        Trước đây enc(xt,tt) trả về z_T (d_model-dim = 128) nhưng
+        XGBoost train trên 1010-dim → crash hoặc garbage predictions.
+        """
         if stay_id not in self._hist:
             self._hist[stay_id] = deque(maxlen=self.history_len)
         self._hist[stay_id].append((x_new.ravel().astype(np.float32), tau_new))
@@ -83,11 +100,20 @@ class MaBoostOnlinePipeline:
         taus = np.array([h[1] for h in hist], dtype=np.float32)
 
         with torch.no_grad():
-            xt = torch.from_numpy(seq).float().unsqueeze(0).to(self.device)
-            tt = torch.from_numpy(taus).float().unsqueeze(0).to(self.device)
-            z  = self.enc(xt, tt).cpu().numpy()
+            xt     = torch.from_numpy(seq).float().unsqueeze(0).to(self.device)
+            tt     = torch.from_numpy(taus).float().unsqueeze(0).to(self.device)
+            # FIX 4: mask cho các timestep thật (tất cả = 1 vì đây là live data)
+            mask_t = torch.ones(1, len(hist), dtype=torch.float32).to(self.device)
+            # FIX 4: dùng extract_features() trả về (z_multi, raw_stats)
+            z_multi, raw_stats = self.enc.extract_features(xt, tt, mask_t)
 
-        F = np.hstack([z, x_static.reshape(1, -1)]).astype(np.float32)
+        # FIX 4: ghép đúng thứ tự như Stage 2 extract_features()
+        F = np.hstack([
+            z_multi.cpu().numpy(),
+            raw_stats.cpu().numpy(),
+            x_static.reshape(1, -1),
+        ]).astype(np.float32)
+
         mort_risk = float(self.xgb_mort.predict(F)[0])
         los_days  = float(self.xgb_los.predict_days(F)[0])
         level     = next(lbl for thr, lbl in self._RISK if mort_risk < thr)
@@ -113,7 +139,7 @@ class MaBoostOnlinePipeline:
         FIX 2 — LOS model updated alongside mortality model in every
                  drift state (severe and mild) so LOS drift is corrected too.
         """
-        dm_m = xgb.DMatrix(F_new, label=y_new,           missing=np.nan)
+        dm_m = xgb.DMatrix(F_new, label=y_new,            missing=np.nan)
         dm_l = xgb.DMatrix(F_new, label=np.log1p(yl_new), missing=np.nan)
 
         # Update rolling AUC tracker
@@ -130,7 +156,7 @@ class MaBoostOnlinePipeline:
             # to silently switch to reg:squarederror (regression objective).
             mort_params = {
                 "process_type": "default",
-                "objective":    "binary:logistic",   # was missing before
+                "objective":    "binary:logistic",
                 "eval_metric":  "auc",
                 "learning_rate": 0.03,
                 "max_depth":    4,
@@ -156,20 +182,18 @@ class MaBoostOnlinePipeline:
 
         elif drift == "mild":
             # Leaf Refresh: keep tree structure, refit leaf weights only.
-            # num_boost_round = total existing trees so all leaves are refreshed.
-            n_trees_m = self.xgb_mort.booster.num_boosted_rounds()
-            n_trees_l = self.xgb_los.booster.num_boosted_rounds()
-
+            # FIX 5: num_boost_round=1 — one pass through all existing trees.
+            # Previous value was n_trees (~800) which ran 800 passes → very slow.
             self.xgb_mort.booster = xgb.train(
                 {"process_type": "update", "updater": "refresh",
                  "refresh_leaf": True, "reg_lambda": 1.0},
-                dm_m, num_boost_round=n_trees_m,
+                dm_m, num_boost_round=1,
                 xgb_model=self.xgb_mort.booster, verbose_eval=False)
             # FIX 2: update LOS model too
             self.xgb_los.booster = xgb.train(
                 {"process_type": "update", "updater": "refresh",
                  "refresh_leaf": True, "reg_lambda": 1.0},
-                dm_l, num_boost_round=n_trees_l,
+                dm_l, num_boost_round=1,
                 xgb_model=self.xgb_los.booster, verbose_eval=False)
 
         print(f"[Update #{self.n_updates:04d}] {drift.upper():<8} "

@@ -3,13 +3,29 @@ src/data/dataset.py
 ===================
 PyTorch Dataset returning (x, tau, mask, x_static, y_mort, y_los).
 
-Normalisation statistics are computed on the TRAINING split ONLY.
-Test and validation data are normalised with training statistics — never
-the other way around (that would be data leakage).
+Key changes vs previous version
+---------------------------------
+NaN-aware normalization:
+  Sequences now contain NaN for features not observed at a given timestamp.
+  Normalization must only apply to observed positions — unobserved stay as
+  0.0 so GRUDImputer can distinguish "not measured" from "measured = 0".
 
-filter_ids_by_obs() must be called AFTER train/val/test split and applied
-to each split separately. Calling it on all_ids before splitting biases
-the study population using information from all splits.
+  Old (wrong):
+    x = (x - mean) / std          # NaN propagates through
+    x = np.clip(x * mask, ...)    # masks to 0 — loses NaN structure
+
+  New (correct):
+    x_norm = (x - mean) / std
+    x = np.where(mask > 0, x_norm, 0.0)   # observed → normalized
+                                           # unobserved → 0.0
+    x = np.clip(x, -CLIP, CLIP)
+
+  GRUDImputer inside MambaEncoder will then impute unobserved positions
+  using time-decay toward the batch mean — correct irregular TS behavior.
+
+Normalisation statistics are computed on the TRAINING split ONLY using
+only OBSERVED values (mask > 0). Zero-padded positions are excluded so
+mean/std reflect true clinical distributions.
 """
 from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
@@ -18,7 +34,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-_CLIP = 5.0   # hard clip after normalisation — prevents fp16/bf16 overflow in Mamba
+_CLIP = 5.0   # hard clip after normalisation — prevents fp16/bf16 overflow
 
 
 # ---------------------------------------------------------------------------
@@ -27,10 +43,8 @@ _CLIP = 5.0   # hard clip after normalisation — prevents fp16/bf16 overflow in
 
 def filter_ids_by_obs(sequences: Dict, ids: List, min_obs: int = 3) -> List:
     """
-    Return the subset of `ids` with at least `min_obs` observed values.
-
-    IMPORTANT: call this AFTER the train/val/test split, applied to each
-    split separately. Do NOT call on all_ids before splitting.
+    Return subset of ids with at least min_obs observed values.
+    Call AFTER train/val/test split, on each split separately.
     """
     return [sid for sid in ids if sequences[sid][2].sum() >= min_obs]
 
@@ -62,67 +76,78 @@ class MaBoostDataset(Dataset):
         return len(self.ids)
 
     def __getitem__(self, idx: int):
-        sid = self.ids[idx]
+        sid        = self.ids[idx]
         seq, tau, mask = self.seqs[sid]
-        x = seq.copy().astype(np.float32)
 
-        # 1. Sanitise raw values from ETL
-        x   = np.nan_to_num(x,   nan=0.0, posinf=0.0, neginf=0.0)
+        # Work on float32 copies
+        x   = seq.copy().astype(np.float32)
+        tau = tau.copy().astype(np.float32)
+        m   = mask.copy().astype(np.float32)
+
+        # 1. Sanitise tau — NaN/inf in tau causes ZOH gate to explode
         tau = np.nan_to_num(tau, nan=60.0, posinf=3600.0, neginf=1.0)
         tau = np.clip(tau, 1.0, 86400.0)
 
-        # 2. Z-score normalise using TRAINING-SPLIT statistics only
-        if self.mean is not None:
-            x = (x - self.mean) / np.maximum(self.std, 1e-6)
+        # 2. NaN-aware Z-score normalisation
+        #    - Only normalize observed positions (mask > 0)
+        #    - Unobserved positions stay 0.0 for GRUDImputer
+        #    - NaN in x at unobserved positions → set to 0.0 first
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # 3. Zero out unobserved positions, hard-clip to [-5, 5]
-        #    Clipping prevents bf16 overflow inside Mamba ZOH step.
-        x = np.clip(x * mask, -_CLIP, _CLIP)
+        if self.mean is not None:
+            x_norm = (x - self.mean) / np.maximum(self.std, 1e-6)
+            # Only apply normalization where feature was actually observed
+            x = np.where(m > 0, x_norm, 0.0)
+
+        # 3. Hard clip to prevent overflow in Mamba ZOH step
+        x = np.clip(x, -_CLIP, _CLIP)
 
         x_t    = torch.from_numpy(x).float()
-        tau_t  = torch.from_numpy(tau.copy()).float()
-        mask_t = torch.from_numpy(mask.copy()).float()
+        tau_t  = torch.from_numpy(tau).float()
+        mask_t = torch.from_numpy(m).float()
         y_mort = torch.tensor(self.mort[sid], dtype=torch.long)
-        y_los  = torch.tensor(max(float(self.los[sid]), 0.0), dtype=torch.float32)
+        y_los  = torch.tensor(
+            max(float(self.los[sid]), 0.0), dtype=torch.float32
+        )
 
         if self.static is not None:
             xs = torch.from_numpy(
-                np.nan_to_num(self.static[sid].copy(), nan=0.0).astype(np.float32)
+                np.nan_to_num(
+                    self.static[sid].copy(), nan=0.0
+                ).astype(np.float32)
             ).float()
             return x_t, tau_t, mask_t, xs, y_mort, y_los
+
         return x_t, tau_t, mask_t, y_mort, y_los
 
     # ------------------------------------------------------------------
     @staticmethod
-    def norm_stats(sequences: Dict, ids: List) -> Tuple[np.ndarray, np.ndarray]:
+    def norm_stats(
+        sequences: Dict, ids: List
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute per-feature min and max over OBSERVED values in `ids`.
-        Returns (min, range) so caller can apply min-max scaling [0,1].
-        APRICOT-M paper §2.3 uses min-max (not z-score) for ICU features.
+        Compute per-feature mean and std over OBSERVED values in ids.
 
-        Uses Welford / running-sum method — never allocates a giant array,
-        safe for 15k+ training stays.
+        Uses running-sum Welford method — never allocates a giant array.
+        Excludes NaN and padding positions (mask == 0).
 
         MUST be called with train_ids only — never with all_ids or val/test.
         """
         n_feats = next(iter(sequences.values()))[0].shape[1]
-        s1  = np.zeros(n_feats, dtype=np.float64)   # sum of values
-        s2  = np.zeros(n_feats, dtype=np.float64)   # sum of squares
+        s1  = np.zeros(n_feats, dtype=np.float64)
+        s2  = np.zeros(n_feats, dtype=np.float64)
         cnt = np.zeros(n_feats, dtype=np.int64)
 
         for sid in ids:
             seq, _, mask = sequences[sid]
-            # Use per-feature mask — NOT row-level mask.
-            # Row-level mask (any feature observed in that row) would include
-            # zero-padded values for unobserved features, pulling mean toward
-            # 0 and deflating variance for rarely-observed features.
-            m   = (mask > 0).astype(bool)   # (L, F)  True = truly observed
+            m   = (mask > 0).astype(bool)          # (L, F) True = observed
             if not m.any():
                 continue
+            # Replace NaN with 0 only for accumulation — NaN positions
+            # have mask=0 anyway so they won't be counted
             vals = np.nan_to_num(
                 seq.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
             )
-            # Only accumulate where the feature was actually observed
             s1  += (vals * m).sum(axis=0)
             s2  += ((vals ** 2) * m).sum(axis=0)
             cnt += m.sum(axis=0)
@@ -133,7 +158,9 @@ class MaBoostDataset(Dataset):
         if ok.any():
             mean[ok] = (s1[ok] / cnt[ok]).astype(np.float32)
             var      = s2[ok] / cnt[ok] - mean[ok].astype(np.float64) ** 2
-            std[ok]  = np.maximum(np.sqrt(np.maximum(var, 0.0)), 1e-6).astype(np.float32)
+            std[ok]  = np.maximum(
+                np.sqrt(np.maximum(var, 0.0)), 1e-6
+            ).astype(np.float32)
         return mean, std
 
 
@@ -148,27 +175,30 @@ def make_loaders(
     train_ids,
     val_ids,
     test_ids,
-    static_features=None,
-    batch_size: int    = 64,
-    num_workers: int   = 4,
+    static_features = None,
+    batch_size: int = 64,
+    num_workers: int = 4,
     oversample_pos: bool = False,
-    device: str        = "cpu",
+    device: str = "cpu",
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Build train / val / test DataLoaders.
 
-    norm_stats is computed on train_ids ONLY — val and test receive the
-    same mean/std for normalisation (no leakage).
-
-    oversample_pos: use WeightedRandomSampler to balance the training
-    set instead of relying solely on class weights in the loss.
+    norm_stats computed from train_ids ONLY — val/test use same stats.
+    oversample_pos: WeightedRandomSampler to balance training set.
+    Note: do not use oversample_pos together with Focal Loss class weights
+    as this double-compensates for class imbalance.
     """
-    # Compute normalisation stats from TRAINING split only
     mean, std = MaBoostDataset.norm_stats(sequences, train_ids)
 
-    kw  = dict(sequences=sequences, mortality_labels=mortality_labels,
-               los_labels=los_labels, static_features=static_features,
-               seq_mean=mean, seq_std=std)
+    kw = dict(
+        sequences        = sequences,
+        mortality_labels = mortality_labels,
+        los_labels       = los_labels,
+        static_features  = static_features,
+        seq_mean         = mean,
+        seq_std          = std,
+    )
     pin = device != "cpu"
 
     train_ds = MaBoostDataset(**kw, stay_ids=train_ids)
@@ -178,21 +208,32 @@ def make_loaders(
         counts  = np.bincount(labels, minlength=2).astype(float)
         counts[counts == 0] = 1.0
         weights = [1.0 / counts[int(l)] for l in labels]
-        sampler = WeightedRandomSampler(weights, num_samples=len(weights),
-                                        replacement=True)
-        tr = DataLoader(train_ds, sampler=sampler, batch_size=batch_size,
-                        num_workers=num_workers, pin_memory=pin)
+        sampler = WeightedRandomSampler(
+            weights, num_samples=len(weights), replacement=True
+        )
+        tr = DataLoader(
+            train_ds, sampler=sampler, batch_size=batch_size,
+            num_workers=num_workers, pin_memory=pin,
+        )
     else:
-        tr = DataLoader(train_ds, shuffle=True, batch_size=batch_size,
-                        num_workers=num_workers, pin_memory=pin)
+        tr = DataLoader(
+            train_ds, shuffle=True, batch_size=batch_size,
+            num_workers=num_workers, pin_memory=pin,
+        )
 
-    va = DataLoader(MaBoostDataset(**kw, stay_ids=val_ids),
-                    shuffle=False, batch_size=batch_size,
-                    num_workers=num_workers, pin_memory=pin)
-    te = DataLoader(MaBoostDataset(**kw, stay_ids=test_ids),
-                    shuffle=False, batch_size=batch_size,
-                    num_workers=num_workers, pin_memory=pin)
+    va = DataLoader(
+        MaBoostDataset(**kw, stay_ids=val_ids),
+        shuffle=False, batch_size=batch_size,
+        num_workers=num_workers, pin_memory=pin,
+    )
+    te = DataLoader(
+        MaBoostDataset(**kw, stay_ids=test_ids),
+        shuffle=False, batch_size=batch_size,
+        num_workers=num_workers, pin_memory=pin,
+    )
 
-    print(f"[Dataset] train={len(train_ids):,}  val={len(val_ids):,}  "
-          f"test={len(test_ids):,}  (norm from train only, no leakage)")
+    print(
+        f"[Dataset] train={len(train_ids):,}  val={len(val_ids):,}  "
+        f"test={len(test_ids):,}  (norm from train only, no leakage)"
+    )
     return tr, va, te

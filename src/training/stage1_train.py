@@ -93,7 +93,7 @@ def mixup_batch(x, tau, mask, y_mort, y_los, x_static=None, alpha=0.4):
         torch.cat([x,      l3             * x[pos]    + (1 - l3)             * x[rn]]),
         torch.cat([tau,    lam.view(-1,1) * tau[pos]  + (1 - lam.view(-1,1)) * tau[rn]]),
         torch.cat([mask,   l3             * mask[pos] + (1 - l3)             * mask[rn]]),
-        torch.cat([y_mort, lam.round().long()]),
+        torch.cat([y_mort, torch.ones(n, dtype=torch.long, device=x.device)]),
         torch.cat([y_los,  lam * y_los[pos] + (1 - lam) * y_los[rn]]),
         xs_out,
     )
@@ -217,8 +217,11 @@ def train_stage1(
     print(f"[Stage 1] pos={n_pos:,} neg={n_neg:,} ({100*n_pos/max(n_tot,1):.1f}%)")
 
     # alpha[0] = weight for negative class, alpha[1] = weight for positive
-    alpha = torch.tensor([n_pos / max(n_tot, 1),
-                          n_neg / max(n_tot, 1)], device=device)
+    w_neg = 1.0 / max(n_neg, 1)
+    w_pos = 1.0 / max(n_pos, 1)
+    total = w_neg + w_pos
+    alpha = torch.tensor([w_neg / total,
+                        w_pos / total], device=device)
     focal = FocalLoss(alpha=alpha, gamma=focal_gamma)
 
     # ── Optimiser + LR ────────────────────────────────────────────────────

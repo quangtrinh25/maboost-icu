@@ -138,7 +138,6 @@ class TimeEmbedding(nn.Module):
         out   = self.gap_net(torch.log1p(tau_h).unsqueeze(-1))   # (B, L, d)
 
         if self.use_circadian and t_abs is not None:
-            # Hours-of-day and day-of-week in [0, 2π]
             hour = (t_abs / 3600.0) % 24.0
             dow  = (t_abs / 86400.0) % 7.0
             circ = torch.stack([
@@ -235,7 +234,10 @@ class MultiResolutionPooling(nn.Module):
         h_mean = (h * valid.unsqueeze(-1)).sum(dim=1) / n_obs      # (B, d)
 
         # 3. Max over all positions
-        h_max  = h.max(dim=1).values                               # (B, d)
+        valid_exp = valid.unsqueeze(-1).expand_as(h)         # (B, L, d)
+        h_masked  = h.masked_fill(valid_exp == 0, float("-inf"))
+        h_max     = h_masked.max(dim=1).values               # (B, d)
+        h_max     = torch.nan_to_num(h_max, neginf=0.0)      # fallback if all masked                               # (B, d)
 
         # 4. Attention-weighted pooling (NaN-safe softmax)
         scores = self.u(torch.tanh(self.W(h)))                     # (B, L, 1)
@@ -280,8 +282,8 @@ class MambaEncoder(nn.Module):
     extract_features() to activate hour-of-day / day-of-week embeddings.
     When t_abs is None the TimeEmbedding falls back to gap-only mode.
     """
-    def __init__(self, d_input: int, d_model: int = 128, d_state: int = 16,
-                 d_conv: int = 4, expand: int = 2, n_layers: int = 3,
+    def __init__(self, d_input: int, d_model: int = 256, d_state: int = 16,
+                 d_conv: int = 4, expand: int = 2, n_layers: int = 4,
                  n_heads: int = 4, dropout: float = 0.1, topk: int = 5,
                  use_circadian: bool = True):
         super().__init__()
@@ -360,7 +362,7 @@ class MambaEncoder(nn.Module):
         Features that were NEVER observed in a stay return NaN for
         last/mean/max/std so XGBoost can route them via its built-in
         sparsity-aware split finder (not confused with "value = 0").
-        miss_rate stays 1.0 — that IS informative signal.
+        miss_rate stays 1.0 — that IS real signal.
         """
         B, L, F = x.shape
         if mask is None:
@@ -426,7 +428,7 @@ class DualHeadMamba(nn.Module):
     For Stage 2, pass this module as `static_proj` to extract_features() so
     the same learned transformation is applied rather than raw x_static.
     """
-    def __init__(self, d_input: int, d_model: int = 128,
+    def __init__(self, d_input: int, d_model: int = 256,
                  d_static: int = 0, **enc_kw):
         super().__init__()
         self.encoder    = MambaEncoder(d_input, d_model, **enc_kw)

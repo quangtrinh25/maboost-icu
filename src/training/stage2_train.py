@@ -1,25 +1,15 @@
 """
-src/training/stage2_train.py
-=============================
-Advanced Stage 2: frozen Mamba encoder → dual XGBoost with Optuna tuning.
-
-Key fixes vs. original:
-  1. NaN PRESERVATION — raw_stats NaN values are no longer forced to 0.0.
-     XGBoost's sparsity-aware split finder handles NaN natively; zero-filling
-     conflated "feature not measured" with "feature value = 0", wrecking the
-     XGBoost-flat baseline (AUROC 0.51 instead of expected 0.70+).
-
-  2. STATIC EMBEDDING PROPAGATION — extract_features() now accepts an optional
-     static_proj (the DualHeadMamba.static_emb learned in Stage 1).  When
-     provided, x_static is projected through the same non-linear transformation
-     that Stage 1 learned, so Stage 2 benefits from the encoder's view of
-     static features rather than discarding it with a raw hstack.
-
-  3. DART / OPTUNA CONSISTENCY — Optuna now mirrors the final booster type.
-     When use_dart=True, trials also use DART so the hyperparameters found
-     (max_depth, learning_rate, etc.) are valid for the same optimiser.
-     EarlyStopping is disabled within Optuna trials when DART is active
-     (DART and EarlyStopping are incompatible in xgboost).
+src/training/stage2_train.py  (v4 — optimised)
+================================================
+Changes vs v3:
+  • _optuna_search: max_depth ceiling 8→10, n_estimators ceiling 1000→2000.
+    With 1266 features, deeper trees and more rounds are needed.
+    Previous ceiling was too conservative — Optuna was likely hitting the
+    n_estimators=1000 wall on many trials.
+  • train_stage2 default n_estimators 500→800, max_depth 5→6.
+    These are the fallback defaults when use_optuna=False.
+  • All NaN preservation, DART/Optuna consistency, and static embedding
+    propagation from v3 are unchanged.
 """
 from __future__ import annotations
 import pickle
@@ -35,6 +25,7 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="xgboost")
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from src.models.mamba_encoder import MambaEncoder
 from src.models.xgboost_head  import XGBMortality, XGBLos
@@ -68,24 +59,9 @@ def extract_features(
 
     F_final = [z_multi(4*d) ; raw_stats(5*F) ; static(42 | projected)]
 
-    Three complementary feature sets:
-      z_multi    — multi-resolution encoder features (last/mean/max/weighted)
-      raw_stats  — per-feature temporal stats (last/mean/max/std/missingness)
-                   NaN for never-observed features → XGBoost sparsity-aware splits
-      x_static   — demographics + comorbidities
-                   If static_proj is supplied (DualHeadMamba.static_emb), the
-                   LEARNED non-linear projection is applied, preserving the
-                   encoder's representation of static context from Stage 1.
-                   Otherwise raw x_static is appended unchanged.
-
-    Parameters
-    ----------
-    enc         : frozen MambaEncoder
-    loader      : DataLoader yielding (x, tau, mask[, x_static], y_mort, y_los)
-    device      : torch device string
-    static_proj : optional nn.Module — pass DualHeadMamba.static_emb to keep
-                  the learned static transformation from Stage 1.
-                  If None, raw x_static is appended (backward-compatible).
+    NaN in raw_stats is intentionally preserved — XGBoost sparsity-aware
+    split finder routes NaN to the optimal child; coercing to 0 conflates
+    "feature not measured" with "feature = 0".
     """
     enc = enc.to(device)
     if static_proj is not None:
@@ -97,18 +73,15 @@ def extract_features(
         x, tau, mask = batch[0].to(device), batch[1].to(device), batch[2].to(device)
         has_static   = len(batch) == 6
 
-        # Multi-resolution encoder features + raw temporal statistics
         z_multi, raw_stats = enc.extract_features(x, tau, mask)
         z_multi   = z_multi.cpu().numpy()
-        raw_stats = raw_stats.cpu().numpy()    # may contain NaN — intentional
+        raw_stats = raw_stats.cpu().numpy()
 
         parts = [z_multi, raw_stats]
 
         if has_static:
             x_static_raw = batch[3]
             if static_proj is not None:
-                # Apply the same learned projection as Stage 1 so XGBoost
-                # sees the encoder's non-linear view of demographics.
                 with torch.no_grad():
                     s_emb = static_proj(
                         torch.nan_to_num(x_static_raw.to(device), nan=0.0)
@@ -121,10 +94,7 @@ def extract_features(
         morts.append(batch[-2].numpy())
         los_arr.append(batch[-1].numpy())
 
-    # CRITICAL: Do NOT force nan=0.0 here.
-    # NaN in raw_stats signals "feature never observed in this stay".
-    # XGBoost's sparsity-aware split finder routes NaN values to the
-    # optimal child node; coercing to 0 conflates missingness with zero value.
+    # CRITICAL: Do NOT replace NaN with 0 here.
     F   = np.vstack(Fs).astype(np.float32)
     y_m = np.concatenate(morts)
     y_l = np.concatenate(los_arr)
@@ -142,26 +112,24 @@ def _optuna_search(
     F_tr: np.ndarray, y_tr: np.ndarray,
     F_va: np.ndarray, y_va: np.ndarray,
     objective: str,
-    n_trials: int = 50,
+    n_trials: int = 200,           # v4: default increased from 100
     booster: str = "gbtree",
+    depth_max: int = 10,           # v4: increased from 8
+    n_estimators_max: int = 2000,  # v4: increased from 1000
 ) -> dict:
     """
-    Return best XGBoost params via Optuna.
+    Return best XGBoost params via Optuna TPE sampler.
 
-    Parameters
-    ----------
-    booster : "gbtree" or "dart"
-        Must match the booster used in the final train_stage2 call.
-        When "dart", EarlyStopping is disabled within trials (incompatible)
-        and a fixed n_estimators is used instead.
-        Previously Optuna always used gbtree/hist while the final model used
-        DART, producing hyperparameters that were inconsistent with the
-        actual training algorithm.
+    v4 changes:
+      depth_max          8    → 10   (wider search, 1266 features benefit)
+      n_estimators_max   1000 → 2000 (previous ceiling was too conservative)
 
-    Falls back gracefully to empty dict if Optuna is not installed.
+    booster must match the final train_stage2 call — when "dart", Optuna
+    trials also use DART and EarlyStopping is disabled (incompatible).
     """
     try:
         import optuna
+        from tqdm import tqdm
         optuna.logging.set_verbosity(optuna.logging.WARNING)
     except ImportError:
         print("  [Optuna] not installed — using default params (pip install optuna)")
@@ -170,6 +138,11 @@ def _optuna_search(
     metric   = "auc" if objective == "binary:logistic" else "rmse"
     maximize = metric == "auc"
     use_dart = booster == "dart"
+
+    # tqdm progress bar — shows best/current AUC, trees, depth, lr per trial
+    pbar = tqdm(total=n_trials, desc=f"  Optuna [{objective[:6]}]",
+                unit="trial", ncols=100)
+    best_so_far = [-np.inf if maximize else np.inf]
 
     def trial_fn(trial):
         p = {
@@ -180,11 +153,11 @@ def _optuna_search(
             "device":           "cuda",
             "seed":             42,
             "verbosity":        0,
-            "max_depth":        trial.suggest_int("max_depth", 3, 8),
-            "learning_rate":    trial.suggest_float("learning_rate", 1e-3, 0.3, log=True),
+            "max_depth":        trial.suggest_int("max_depth", 3, depth_max),
+            "learning_rate":    trial.suggest_float("learning_rate", 5e-4, 0.15, log=True),
             "subsample":        trial.suggest_float("subsample", 0.5, 1.0),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-            "min_child_weight": trial.suggest_int("min_child_weight", 1, 20),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 1.0),
+            "min_child_weight": trial.suggest_int("min_child_weight", 3, 30),
             "reg_alpha":        trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
             "reg_lambda":       trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
             "gamma":            trial.suggest_float("gamma", 0.0, 5.0),
@@ -197,13 +170,12 @@ def _optuna_search(
             spw = float((y_tr == 0).sum() / max((y_tr == 1).sum(), 1))
             p["scale_pos_weight"] = spw
 
-        n_rounds = trial.suggest_int("n_estimators", 100, 1000)
+        n_rounds = trial.suggest_int("n_estimators", 100, n_estimators_max)
 
         dm_tr = xgb.DMatrix(F_tr, label=y_tr, missing=np.nan)
         dm_va = xgb.DMatrix(F_va, label=y_va, missing=np.nan)
 
         if use_dart:
-            # EarlyStopping incompatible with DART — use fixed n_rounds
             bst = xgb.train(p, dm_tr, n_rounds,
                             evals=[(dm_va, "val")], verbose_eval=False)
         else:
@@ -215,11 +187,28 @@ def _optuna_search(
         pred = bst.predict(dm_va)
         from sklearn.metrics import roc_auc_score, mean_squared_error
         if objective == "binary:logistic":
-            return roc_auc_score(y_va, pred)
-        return -np.sqrt(mean_squared_error(y_va, pred))
+            score = roc_auc_score(y_va, pred)
+        else:
+            score = -np.sqrt(mean_squared_error(y_va, pred))
+
+        # Update progress bar with current trial stats
+        improved = score > best_so_far[0] if maximize else score < best_so_far[0]
+        if improved:
+            best_so_far[0] = score
+        pbar.update(1)
+        pbar.set_postfix({
+            "best": f"{best_so_far[0]:.4f}",
+            "cur":  f"{score:.4f}",
+            "trees": bst.num_boosted_rounds(),
+            "depth": p["max_depth"],
+            "lr":    f"{p['learning_rate']:.4f}",
+        })
+        return score
 
     study = optuna.create_study(direction="maximize")
     study.optimize(trial_fn, n_trials=n_trials, show_progress_bar=False)
+    pbar.close()
+
     print(f"  [Optuna] best value: {study.best_value:.4f}  "
           f"trials: {len(study.trials)}")
     return study.best_params
@@ -236,7 +225,6 @@ def _drop_low_importance(
     F_te: np.ndarray,
     drop_frac: float = 0.10,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, list]:
-    """Drop bottom `drop_frac` of features by XGBoost gain importance."""
     scores = bst.get_score(importance_type="gain")
     if not scores:
         return F_tr, F_va, F_te, list(range(F_tr.shape[1]))
@@ -250,7 +238,7 @@ def _drop_low_importance(
 
 
 # ---------------------------------------------------------------------------
-# Platt scaling for mortality calibration
+# Platt scaling
 # ---------------------------------------------------------------------------
 
 def _platt_calibrate(
@@ -258,7 +246,6 @@ def _platt_calibrate(
     F_va: np.ndarray,
     y_va: np.ndarray,
 ) -> LogisticRegression:
-    """Fit Platt scaling (logistic regression) on validation predictions."""
     raw = bst.predict(xgb.DMatrix(F_va, missing=np.nan)).reshape(-1, 1)
     lr  = LogisticRegression(C=1.0, max_iter=1000, solver="lbfgs")
     lr.fit(raw, y_va.astype(int))
@@ -276,8 +263,8 @@ def train_stage2(
     F_te:  Optional[np.ndarray] = None,
     ckpt_dir: str   = "checkpoints",
     xgb_device: str = "cuda",
-    n_estimators: int   = 500,
-    max_depth:    int   = 5,
+    n_estimators: int   = 800,     # v4: increased from 500
+    max_depth:    int   = 6,       # v4: increased from 5
     learning_rate: float = 0.05,
     subsample:     float = 0.8,
     colsample_bytree: float = 0.8,
@@ -285,27 +272,20 @@ def train_stage2(
     reg_lambda: float = 1.0,
     early_stopping: int = 30,
     use_optuna: bool = True,
-    n_optuna_trials: int = 100,
+    n_optuna_trials: int = 200,    # v4: increased from 100
+    optuna_depth_max: int = 10,    # v4: new parameter
+    optuna_n_max: int = 2000,      # v4: new parameter
     use_dart: bool = False,
     use_calibration: bool = True,
     use_isotonic: bool = True,
     drop_low_importance: bool = True,
 ) -> Tuple[XGBMortality, XGBLos]:
     """
-    Train two XGBoost models on frozen Mamba features.
+    Train two XGBoost models on frozen Mamba encoder features.
 
-    Parameters
-    ----------
-    use_dart : bool
-        When True, Optuna trials also use DART so found hyperparameters
-        (depth, lr, etc.) are calibrated to the same booster.  Previously,
-        Optuna used gbtree/hist while the final model used DART — producing
-        hyperparameters inconsistent with the training algorithm.
-
-    Returns
-    -------
-    xgb_mort : XGBMortality  (with Platt scaling if use_calibration=True)
-    xgb_los  : XGBLos        (with isotonic correction if use_isotonic=True)
+    v4 changes: wider Optuna search (depth_max=10, n_max=2000),
+    larger default n_estimators (800) and max_depth (6).
+    All NaN handling and calibration logic unchanged from v3.
     """
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
 
@@ -325,7 +305,9 @@ def train_stage2(
         best_p = _optuna_search(
             F_tr, ym_tr, F_va, ym_va,
             "binary:logistic", n_optuna_trials,
-            booster=booster_type,               # FIX: match final booster
+            booster=booster_type,
+            depth_max=optuna_depth_max,
+            n_estimators_max=optuna_n_max,
         )
         params_m = {**default_p, **best_p}
     else:
@@ -334,7 +316,6 @@ def train_stage2(
     spw = float((ym_tr == 0).sum() / max((ym_tr == 1).sum(), 1))
     print(f"  scale_pos_weight={spw:.1f}")
 
-    # n_estimators may come from Optuna; pop before building full_p_m
     n_rounds = int(params_m.pop("n_estimators", n_estimators))
 
     full_p_m = {
@@ -348,13 +329,11 @@ def train_stage2(
         **params_m,
     }
     if use_dart:
-        # Merge DART-specific params from Optuna if present, else use defaults
         full_p_m.setdefault("rate_drop",       0.1)
         full_p_m.setdefault("skip_drop",       0.5)
         full_p_m.setdefault("sample_type",    "uniform")
         full_p_m.setdefault("normalize_type", "tree")
 
-    # EarlyStopping is incompatible with DART; use fixed rounds instead
     callbacks_m = None
     if not use_dart and early_stopping and early_stopping > 0:
         callbacks_m = [xgb.callback.EarlyStopping(
@@ -369,7 +348,7 @@ def train_stage2(
                            evals=[(dm_tr_m, "train"), (dm_va_m, "val")],
                            callbacks=callbacks_m, verbose_eval=50)
     except AttributeError as e:
-        print(f"  [Stage 2] xgb.train callback error, retrying without callbacks: {e}")
+        print(f"  [Stage 2] xgb.train callback error, retrying: {e}")
         bst_m = xgb.train(full_p_m, dm_tr_m, n_rounds,
                            evals=[(dm_tr_m, "train"), (dm_va_m, "val")],
                            verbose_eval=50)
@@ -378,7 +357,6 @@ def train_stage2(
         bi = getattr(bst_m, "best_ntree_limit", None)
         bst_m.best_iteration = bi if bi is not None else 0
 
-    # Feature importance filter → refit on reduced feature set
     if drop_low_importance and F_te is not None:
         F_tr_m, F_va_m, F_te_m, keep_idx = _drop_low_importance(
             bst_m, F_tr, F_va, F_te
@@ -429,7 +407,9 @@ def train_stage2(
         best_p_l = _optuna_search(
             F_tr, np.log1p(yl_tr), F_va, np.log1p(yl_va),
             "reg:squarederror", n_optuna_trials,
-            booster="gbtree",   # LOS uses gbtree (DART rarely helps for regression)
+            booster="gbtree",
+            depth_max=optuna_depth_max,
+            n_estimators_max=optuna_n_max,
         )
         params_l = {**default_p, **best_p_l}
     else:

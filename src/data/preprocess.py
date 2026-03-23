@@ -7,12 +7,31 @@ Stages
 ------
 1. infer_age          DOB → anchor_age; clamp MIMIC-III 300-yr artefact → 91.4
 2. filter_by_age      drop stays where age < min_age
-3. align_labs         restrict LABEVENTS to each ICU window [intime, outtime]
+3. align_labs         restrict LABEVENTS to each ICU window [intime, intime+48h]
 4. merge_events       chart ∪ labs; °F → °C; itemid → feature name
 5. compute_delta_t    τ_t (seconds) via Polars .over() — zero Python loops
-6. build_sequences    pivot → (seq_len, 47) float32 arrays
+6. build_sequences    pivot → (seq_len, N_FEAT) timestamp-level arrays
 7. build_static       42-dim static vector per stay (demographics + Elixhauser)
 8. build_labels       y_mort (0/1)  +  y_los (fractional days)
+
+Key changes vs previous version
+---------------------------------
+- build_sequences: group events by MINUTE timestamp instead of per-event rows.
+  Each row in the sequence = 1 unique minute timestamp with ALL features
+  observed at that minute. This is the correct representation for irregular
+  time series — tau_t is now the gap between consecutive measurement times,
+  not between consecutive events of any feature.
+
+- align_labs / merge_events: window restricted to [intime, intime + 48h]
+  to match the 48h prediction window used by HyMaTE, EHR-Mamba, DuETT.
+
+- seq_len default raised to 128 to accommodate timestamp-level sequences
+  (48h × ~2-3 measurements/hour ≈ 100-150 unique timestamps per stay).
+
+- Sequences now contain NaN for features NOT observed at a given timestamp
+  so GRUDImputer can apply time-decay imputation correctly.
+  Previously all unobserved positions were 0 — conflating "not measured"
+  with "value = 0".
 """
 from __future__ import annotations
 import pickle
@@ -33,7 +52,7 @@ _CHART: Dict[str, List[int]] = {
     "spo2":         [646, 220277],
     "resp_rate":    [615, 618, 220210, 224690],
     "temp_c":       [223762, 676],
-    "temp_f":       [223761, 678],     # converted to °C
+    "temp_f":       [223761, 678],
     "gcs_total":    [198, 220739],
     "gcs_verbal":   [723, 223900],
     "gcs_motor":    [454, 223901],
@@ -77,7 +96,7 @@ for _f, _ids in {**_CHART, **_LAB}.items():
         _ITEMID_MAP[_i] = _f
 _FAHRENHEIT: set = set(_CHART["temp_f"])
 
-FEATURE_NAMES: List[str] = list(dict.fromkeys(_ITEMID_MAP.values()))  # 47
+FEATURE_NAMES: List[str] = list(dict.fromkeys(_ITEMID_MAP.values()))
 N_FEAT = len(FEATURE_NAMES)
 
 _ELIX: Dict[str, List[str]] = {
@@ -118,8 +137,9 @@ STATIC_NAMES: List[str] = [
     "micu", "sicu", "cicu", "nicu", "csru",
 ] + list(_ELIX.keys())   # 12 + 30 = 42
 
-PAD_TAU = 60.0
-MIN_TAU = 1.0
+PAD_TAU      = 60.0    # seconds — padding tau value
+MIN_TAU      = 1.0     # minimum gap in seconds
+WINDOW_HOURS = 48.0    # prediction window: first 48h of ICU stay
 MIMIC3_MAX_AGE = 91.4
 
 
@@ -137,66 +157,91 @@ def infer_age(patients: pl.DataFrame, admissions: pl.DataFrame) -> pl.DataFrame:
                 .when(pl.col(col) < 0).then(pl.lit(0.0))
                 .otherwise(pl.col(col)).cast(pl.Float32).alias("anchor_age")
             )
-    if "dob" in cols and not admissions.is_empty() and "admittime" in {c.lower() for c in admissions.columns}:
+    if "dob" in cols and not admissions.is_empty() and \
+            "admittime" in {c.lower() for c in admissions.columns}:
         first = (
             admissions.select(["subject_id", "admittime"])
-            .with_columns(pl.col("admittime").str.to_datetime(format="%Y-%m-%d %H:%M:%S", strict=False))
+            .with_columns(
+                pl.col("admittime").str.to_datetime(
+                    format="%Y-%m-%d %H:%M:%S", strict=False)
+            )
             .group_by("subject_id")
             .agg(pl.col("admittime").min().alias("fa"))
         )
         return (
             patients.join(first, on="subject_id", how="left")
-            .with_columns(pl.col("dob").str.to_datetime(format="%Y-%m-%d %H:%M:%S", strict=False))
+            .with_columns(
+                pl.col("dob").str.to_datetime(
+                    format="%Y-%m-%d %H:%M:%S", strict=False)
+            )
             .with_columns(
                 ((pl.col("fa") - pl.col("dob")).dt.total_days() / 365.25)
                 .clip(0, 150).fill_null(0.0).cast(pl.Float32).alias("anchor_age")
             ).drop("fa")
         )
-    return patients.with_columns(pl.lit(0.0).cast(pl.Float32).alias("anchor_age"))
+    return patients.with_columns(
+        pl.lit(0.0).cast(pl.Float32).alias("anchor_age")
+    )
 
 
 # ---------------------------------------------------------------------------
 # Stage 2 — age filter
 # ---------------------------------------------------------------------------
-def filter_by_age(icu: pl.DataFrame, patients: pl.DataFrame, min_age: int = 18) -> pl.DataFrame:
+def filter_by_age(
+    icu: pl.DataFrame, patients: pl.DataFrame, min_age: int = 18
+) -> pl.DataFrame:
     if icu.is_empty() or "anchor_age" not in patients.columns:
         return icu
-    eligible = patients.filter(pl.col("anchor_age") >= min_age).select("subject_id")
-    n0 = icu.height
+    eligible = patients.filter(
+        pl.col("anchor_age") >= min_age
+    ).select("subject_id")
+    n0  = icu.height
     out = icu.join(eligible, on="subject_id", how="semi")
     print(f"  Age filter (≥{min_age}): {out.height:,} / {n0:,} stays kept")
     return out
 
 
 # ---------------------------------------------------------------------------
-# Stage 3 — align lab events to ICU window
+# Stage 3 — align lab events to 48h ICU window
 # ---------------------------------------------------------------------------
 def align_labs(labs: pl.DataFrame, icu: pl.DataFrame) -> pl.DataFrame:
-    # Robust: ensure we always return a polars DataFrame (never None)
+    """
+    Restrict LABEVENTS to [intime, intime + 48h] per stay.
+
+    Change vs previous: upper bound is intime + 48h (not outtime) so
+    both chart and lab events cover exactly the same 48h prediction window.
+    """
     if labs is None or labs.is_empty() or icu is None or icu.is_empty():
         return pl.DataFrame()
     icu_cols = {c.lower() for c in icu.columns}
     if not {"hadm_id", "icustay_id", "intime", "outtime"}.issubset(icu_cols):
         return pl.DataFrame()
 
-    win = icu.select(["hadm_id", "icustay_id", "intime", "outtime"]).with_columns([
-        pl.col("hadm_id").cast(pl.Int64, strict=False),
-        pl.col("intime").cast(pl.Datetime, strict=False),
-        pl.col("outtime").cast(pl.Datetime, strict=False),
-    ])
-    # Convert charttime to Datetime only for the time-window filter,
-    # then keep original str charttime so it matches chartevents type
-    # and can be safely concatenated in merge_events.
-    if "charttime" in labs.columns:
-        ct_dtype = labs.schema.get("charttime", None)
-    else:
-        ct_dtype = None
+    win = (
+        icu.select(["hadm_id", "icustay_id", "intime", "outtime"])
+        .with_columns([
+            pl.col("hadm_id").cast(pl.Int64, strict=False),
+            pl.col("intime").cast(pl.Datetime, strict=False),
+            pl.col("outtime").cast(pl.Datetime, strict=False),
+        ])
+        .with_columns(
+            # Upper bound: intime + 48h OR outtime, whichever is earlier
+            pl.min_horizontal(
+                pl.col("intime") + pl.duration(hours=int(WINDOW_HOURS)),
+                pl.col("outtime"),
+            ).alias("window_end")
+        )
+    )
 
-    if ct_dtype is not None and ct_dtype == pl.Utf8:
-        ct_expr = pl.col("charttime").str.to_datetime(format="%Y-%m-%d %H:%M:%S", strict=False).alias("_ct_dt")
+    ct_dtype = labs.schema.get("charttime", None)
+    if ct_dtype == pl.Utf8:
+        ct_expr = pl.col("charttime").str.to_datetime(
+            format="%Y-%m-%d %H:%M:%S", strict=False
+        ).alias("_ct_dt")
     else:
-        # already datetime (or unknown) — use as-is (cast defensively)
-        ct_expr = pl.col("charttime").cast(pl.Datetime, strict=False).alias("_ct_dt")
+        ct_expr = pl.col("charttime").cast(
+            pl.Datetime, strict=False
+        ).alias("_ct_dt")
 
     out = (
         labs.with_columns([
@@ -204,40 +249,75 @@ def align_labs(labs: pl.DataFrame, icu: pl.DataFrame) -> pl.DataFrame:
             pl.col("hadm_id").cast(pl.Int64, strict=False),
         ])
         .join(win, on="hadm_id", how="inner")
-        .filter((pl.col("_ct_dt") >= pl.col("intime")) &
-                (pl.col("_ct_dt") <= pl.col("outtime")))
-        .drop(["intime", "outtime", "hadm_id", "_ct_dt"])
+        .filter(
+            (pl.col("_ct_dt") >= pl.col("intime")) &
+            (pl.col("_ct_dt") <= pl.col("window_end"))
+        )
+        .drop(["intime", "outtime", "window_end", "hadm_id", "_ct_dt"])
     )
     return out
 
 
 # ---------------------------------------------------------------------------
-# Stage 4 — merge events
+# Stage 4 — merge events (restricted to 48h window)
 # ---------------------------------------------------------------------------
-def merge_events(chart: pl.DataFrame, labs: pl.DataFrame, icu: pl.DataFrame) -> pl.DataFrame:
-    # Robust: accept None inputs and coerce to empty DataFrame
-    if chart is None:
-        chart = pl.DataFrame()
-    if labs is None:
-        labs = pl.DataFrame()
-    if icu is None:
-        icu = pl.DataFrame()
+def merge_events(
+    chart: pl.DataFrame, labs: pl.DataFrame, icu: pl.DataFrame
+) -> pl.DataFrame:
+    if chart is None: chart = pl.DataFrame()
+    if labs  is None: labs  = pl.DataFrame()
+    if icu   is None: icu   = pl.DataFrame()
 
-    # Cast icustay_id in icu to i64 so it matches chartevents (which may load as i64 or str)
-    valid  = icu.select(pl.col("icustay_id").cast(pl.Int64, strict=False)) if not icu.is_empty() else pl.DataFrame()
-    imap   = pl.DataFrame({"itemid": list(_ITEMID_MAP), "feat": list(_ITEMID_MAP.values())})
-    parts  = []
+    # Build 48h window per stay for chart events
+    if not icu.is_empty():
+        win = (
+            icu.select(["icustay_id", "intime", "outtime"])
+            .with_columns([
+                pl.col("icustay_id").cast(pl.Int64, strict=False),
+                pl.col("intime").cast(pl.Datetime, strict=False),
+                pl.col("outtime").cast(pl.Datetime, strict=False),
+            ])
+            .with_columns(
+                pl.min_horizontal(
+                    pl.col("intime") + pl.duration(hours=int(WINDOW_HOURS)),
+                    pl.col("outtime"),
+                ).alias("window_end")
+            )
+        )
+        valid = win.select("icustay_id")
+    else:
+        win   = pl.DataFrame()
+        valid = pl.DataFrame()
+
+    imap  = pl.DataFrame({
+        "itemid": list(_ITEMID_MAP),
+        "feat":   list(_ITEMID_MAP.values()),
+    })
+    parts = []
 
     if not chart.is_empty() and "icustay_id" in chart.columns:
-        c = (chart
-                  .with_columns(pl.col("icustay_id").cast(pl.Int64, strict=False))
-                  .filter(pl.col("valuenum").is_not_null())
-                  .join(valid, on="icustay_id", how="semi")
-                  .with_columns(
-                      pl.when(pl.col("itemid").is_in(list(_FAHRENHEIT)))
-                      .then((pl.col("valuenum") - 32.0) * 5.0 / 9.0)
-                      .otherwise(pl.col("valuenum")).alias("valuenum")
-                  ))
+        c = (
+            chart
+            .with_columns(pl.col("icustay_id").cast(pl.Int64, strict=False))
+            .filter(pl.col("valuenum").is_not_null())
+            .join(valid, on="icustay_id", how="semi")
+        )
+        # Filter chart to 48h window
+        if not win.is_empty():
+            c = (
+                c.join(win, on="icustay_id", how="left")
+                .filter(
+                    pl.col("charttime").is_not_null() &
+                    (pl.col("charttime") >= pl.col("intime")) &
+                    (pl.col("charttime") <= pl.col("window_end"))
+                )
+                .drop(["intime", "outtime", "window_end"])
+            )
+        c = c.with_columns(
+            pl.when(pl.col("itemid").is_in(list(_FAHRENHEIT)))
+            .then((pl.col("valuenum") - 32.0) * 5.0 / 9.0)
+            .otherwise(pl.col("valuenum")).alias("valuenum")
+        )
         parts.append(c)
 
     if not labs.is_empty():
@@ -248,40 +328,41 @@ def merge_events(chart: pl.DataFrame, labs: pl.DataFrame, icu: pl.DataFrame) -> 
 
     combined = pl.concat(parts, how="diagonal") if len(parts) > 1 else parts[0]
     combined = (
-        combined.join(imap, on="itemid", how="inner")
-        .drop("itemid").rename({"feat": "feature_name"})
+        combined
+        .join(imap, on="itemid", how="inner")
+        .drop("itemid")
+        .rename({"feat": "feature_name"})
     )
-    print(f"  Merge       : {combined.height:,} events · "
-          f"{combined['icustay_id'].n_unique():,} stays · "
-          f"{combined['feature_name'].n_unique()} features")
+    print(
+        f"  Merge       : {combined.height:,} events · "
+        f"{combined['icustay_id'].n_unique():,} stays · "
+        f"{combined['feature_name'].n_unique()} features"
+    )
     return combined
 
 
 # ---------------------------------------------------------------------------
-# Stage 5 — delta-t
+# Stage 5 — delta-t (unchanged logic, works on any granularity)
 # ---------------------------------------------------------------------------
 def compute_delta_t(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Compute tau_t (seconds) between consecutive observations within each icustay.
-    Robust to charttime being either string or already Datetime.
-    Leaves 'charttime' column intact for downstream code.
+    Compute tau_t (seconds) between consecutive observations within each stay.
+    Robust to charttime being either string or Datetime.
     """
     if df is None or df.is_empty():
         return pl.DataFrame()
 
-    # Determine if charttime column is string or already datetime
     ct_dtype = df.schema.get("charttime", None)
-
     if ct_dtype == pl.Utf8:
-        # charttime is string: parse to datetime and produce epoch seconds
         df2 = (
             df.with_columns(
-                pl.col("charttime").str.to_datetime(format="%Y-%m-%d %H:%M:%S", strict=False).alias("_ct_dt")
+                pl.col("charttime")
+                .str.to_datetime(format="%Y-%m-%d %H:%M:%S", strict=False)
+                .alias("_ct_dt")
             )
             .with_columns(pl.col("_ct_dt").dt.epoch("s").alias("_ts_epoch"))
         )
     else:
-        # charttime already datetime (or unknown): cast defensively to Datetime then epoch
         df2 = (
             df.with_columns(
                 pl.col("charttime").cast(pl.Datetime, strict=False).alias("_ct_dt")
@@ -289,110 +370,156 @@ def compute_delta_t(df: pl.DataFrame) -> pl.DataFrame:
             .with_columns(pl.col("_ct_dt").dt.epoch("s").alias("_ts_epoch"))
         )
 
-    # compute delta per icustay using epoch seconds
     out = (
         df2.sort(["icustay_id", "_ts_epoch"])
         .with_columns(
-            (pl.col("_ts_epoch") - pl.col("_ts_epoch").shift(1).over("icustay_id")).alias("_raw")
+            (pl.col("_ts_epoch") -
+             pl.col("_ts_epoch").shift(1).over("icustay_id")).alias("_raw")
         )
         .with_columns(
-            pl.col("_raw").fill_null(pl.col("_raw").median().over("icustay_id"))
-            .clip(lower_bound=MIN_TAU).cast(pl.Float32).alias("tau_t")
+            pl.col("_raw")
+            .fill_null(pl.col("_raw").median().over("icustay_id"))
+            .clip(lower_bound=MIN_TAU)
+            .cast(pl.Float32)
+            .alias("tau_t")
         )
-        # keep original charttime and other columns; drop helpers
         .drop(["_raw", "_ts_epoch", "_ct_dt"])
     )
     return out
 
 
 # ---------------------------------------------------------------------------
-# Stage 6 — sequences
+# Stage 6 — build_sequences (MAJOR REWRITE)
 # ---------------------------------------------------------------------------
-def build_sequences(df: pl.DataFrame, seq_len: int) -> Dict:
+def build_sequences(df: pl.DataFrame, seq_len: int = 128) -> Dict:
     """
-    Pivot long events -> per-stay (seq_len, N_FEAT) arrays.
-    Robust sorting: prefer epoch 'ts' if present, else 'charttime'.
+    Pivot long events → per-stay (seq_len, N_FEAT) timestamp-level arrays.
+
+    KEY CHANGE: group events by MINUTE timestamp before pivoting.
+    Each row in the output matrix = 1 unique minute in the stay.
+    Multiple features measured at the same minute go into the same row.
+    Features NOT measured at a given minute = NaN (not 0.0).
+
+    This is the correct representation for irregular time series:
+    - tau_t = gap between consecutive MEASUREMENT TIMES (not events)
+    - ZOH gate decays by real elapsed time between measurements
+    - GRUDImputer fills NaN via time-decay toward batch mean
+
+    Sequence construction:
+    1. Truncate to WINDOW_HOURS (48h) from first observation
+    2. Group by minute → unique timestamps
+    3. Take last seq_len timestamps (most recent context)
+    4. Pad shorter stays with NaN rows at the front
     """
     fidx = {f: i for i, f in enumerate(FEATURE_NAMES)}
     out  = {}
+
     if df is None or df.is_empty():
         print(f"  Sequences   : 0 stays ({seq_len}×{N_FEAT})")
         return out
 
-    # group_by returns tuples like (sid,), iterate safely
+    # Add minute-level timestamp for grouping
+    df = df.with_columns(
+        pl.col("charttime")
+        .cast(pl.Datetime, strict=False)
+        .dt.truncate("1m")         # round down to minute
+        .alias("_minute")
+    )
+
+    n_stays_total   = 0
+    n_stays_ok      = 0
+    obs_counts      = []
+
     for (sid,), grp in df.group_by(["icustay_id"]):
-        # Robust sort key: prefer numeric epoch-like column 'ts' or 'tau_t' if present,
-        # otherwise fall back to 'charttime'.
-        if "ts" in grp.columns:
-            grp = grp.sort("ts")
-        elif "tau_t" in grp.columns:
-            # tau_t is per-row delta; prefer sorting by charttime if available
-            if "charttime" in grp.columns:
-                grp = grp.sort("charttime")
-            else:
-                grp = grp.sort("tau_t")
-        elif "charttime" in grp.columns:
-            grp = grp.sort("charttime")
+        n_stays_total += 1
+        grp = grp.sort("_minute")
+
+        if grp.height == 0:
+            continue
+
+        # --- Get unique minute timestamps ---
+        minutes = grp["_minute"].unique().sort()
+        T_full  = len(minutes)
+
+        if T_full == 0:
+            continue
+
+        # --- Build full (T_full, N_FEAT) matrix with NaN ---
+        seq_full  = np.full((T_full, N_FEAT), np.nan, dtype=np.float32)
+        mask_full = np.zeros((T_full, N_FEAT), dtype=np.float32)
+
+        # Map minute → row index
+        minute_list = minutes.to_list()
+        m2idx       = {m: i for i, m in enumerate(minute_list)}
+
+        # Fill matrix: for each event, find its minute row and feature col
+        for row in grp.iter_rows(named=True):
+            t_idx = m2idx.get(row["_minute"])
+            j     = fidx.get(row["feature_name"])
+            if t_idx is not None and j is not None:
+                v = row["valuenum"]
+                if v is not None and not np.isnan(float(v)):
+                    seq_full[t_idx, j]  = float(v)
+                    mask_full[t_idx, j] = 1.0
+
+        # --- Compute tau_t between consecutive minutes ---
+        # Use epoch seconds of each unique minute
+        epochs  = np.array([
+            int(m.timestamp()) if hasattr(m, "timestamp")
+            else int(m.seconds_since_epoch())
+            for m in minute_list
+        ], dtype=np.float64)
+        tau_full         = np.empty(T_full, dtype=np.float32)
+        tau_full[0]      = PAD_TAU
+        tau_full[1:]     = np.diff(epochs).clip(min=MIN_TAU).astype(np.float32)
+
+        # --- Take last seq_len timestamps ---
+        if T_full >= seq_len:
+            seq  = seq_full[-seq_len:]
+            tau  = tau_full[-seq_len:]
+            mask = mask_full[-seq_len:]
         else:
-            # fallback: keep original order
-            grp = grp
+            # Pad at the front with NaN rows, PAD_TAU, zero mask
+            pad  = seq_len - T_full
+            seq  = np.vstack([
+                np.full((pad, N_FEAT), np.nan, dtype=np.float32),
+                seq_full,
+            ])
+            tau  = np.concatenate([
+                np.full(pad, PAD_TAU, dtype=np.float32),
+                tau_full,
+            ])
+            mask = np.vstack([
+                np.zeros((pad, N_FEAT), dtype=np.float32),
+                mask_full,
+            ])
 
-        T   = grp.height
-        seq  = np.zeros((T, N_FEAT), dtype=np.float32)
-        mask = np.zeros((T, N_FEAT), dtype=np.float32)
-
-        # iterate features present in this stay
-        for (fn,), sub in grp.group_by(["feature_name"]):
-            j = fidx.get(fn)
-            if j is None:
-                continue
-            # sort sub by same robust key as above
-            if "ts" in sub.columns:
-                sub_sorted = sub.sort("ts")
-            elif "charttime" in sub.columns:
-                sub_sorted = sub.sort("charttime")
-            else:
-                sub_sorted = sub
-            v = sub_sorted["valuenum"].to_numpy().astype(np.float32)
-            n = min(len(v), T)
-            seq[:n, j] = v[:n]
-            mask[:n, j] = 1.0
-
-        # tau: prefer tau_t column if present, else fallback to PAD_TAU for padding
-        if "tau_t" in grp.columns:
-            tau = grp["tau_t"].to_numpy().astype(np.float32)
-        else:
-            # if no tau_t, create a default increasing array (or PAD_TAU)
-            tau = np.full(T, PAD_TAU, dtype=np.float32)
-
-        if T >= seq_len:
-            seq, tau, mask = seq[-seq_len:], tau[-seq_len:], mask[-seq_len:]
-        else:
-            pad  = seq_len - T
-            z    = np.zeros((pad, N_FEAT), dtype=np.float32)
-            seq  = np.vstack([z, seq])
-            tau  = np.concatenate([np.full(pad, PAD_TAU, dtype=np.float32), tau])
-            mask = np.vstack([z, mask])
-
-        # FIX: MIN_OBS_PER_STAY filter removed from here.
-        # Filtering on the full dataset before train/val/test split causes data leakage
-        # — the decision of which stays to drop is influenced by val/test distribution.
-        # Use filter_ids_by_obs() from dataset.py on train_ids only, after splitting.
         out[sid] = (seq, tau, mask)
+        n_stays_ok += 1
+        obs_counts.append(int(mask.sum()))
 
-    print(f"  Sequences   : {len(out):,} stays ({seq_len}×{N_FEAT})")
+    avg_obs = float(np.mean(obs_counts)) if obs_counts else 0.0
+    print(
+        f"  Sequences   : {n_stays_ok:,} stays ({seq_len}×{N_FEAT})  "
+        f"avg_obs={avg_obs:.1f}"
+    )
     return out
 
 
 # ---------------------------------------------------------------------------
-# Stage 7 — static features
+# Stage 7 — static features (unchanged)
 # ---------------------------------------------------------------------------
 def build_static_features(icu, patients, admissions, diagnoses) -> Dict:
     elix: Dict[int, List[float]] = {}
     if not diagnoses.is_empty() and "icd9_code" in diagnoses.columns:
         for (hid,), g in diagnoses.group_by(["hadm_id"]):
-            codes = {c.replace(".", "").strip() for c in g["icd9_code"].drop_nulls().to_list()}
-            elix[int(hid)] = [float(bool(codes & set(v))) for v in _ELIX.values()]
+            codes = {
+                c.replace(".", "").strip()
+                for c in g["icd9_code"].drop_nulls().to_list()
+            }
+            elix[int(hid)] = [
+                float(bool(codes & set(v))) for v in _ELIX.values()
+            ]
 
     age_sex: Dict[int, Tuple] = {}
     if not patients.is_empty():
@@ -422,20 +549,24 @@ def build_static_features(icu, patients, admissions, diagnoses) -> Dict:
         age, gm = age_sex.get(sid, (0.0, 0.0))
         ai = adm_info.get(hid, {})
         t, ins = ai.get("t", ""), ai.get("i", "")
-        f = [age, gm,
-             float("EMERGENCY" in t), float("ELECTIVE" in t),
-             float("MEDICARE"  in ins), float("MEDICAID" in ins), float("PRIVATE" in ins),
-             float("MICU" in unit), float("SICU" in unit),
-             float("CICU" in unit or "CCU" in unit),
-             float("NICU" in unit), float("CSRU" in unit)]
+        f = [
+            age, gm,
+            float("EMERGENCY" in t), float("ELECTIVE" in t),
+            float("MEDICARE"  in ins), float("MEDICAID" in ins),
+            float("PRIVATE"   in ins),
+            float("MICU" in unit), float("SICU" in unit),
+            float("CICU" in unit or "CCU" in unit),
+            float("NICU" in unit), float("CSRU" in unit),
+        ]
         f.extend(elix.get(hid, [0.0] * 30))
         out[icid] = np.array(f, dtype=np.float32)
+
     print(f"  Static      : {len(out):,} vectors × {len(STATIC_NAMES)} features")
     return out
 
 
 # ---------------------------------------------------------------------------
-# Stage 8 — labels
+# Stage 8 — labels (unchanged)
 # ---------------------------------------------------------------------------
 def build_labels(icu, admissions) -> Tuple[Dict, Dict]:
     expire: Dict[int, int] = {}
@@ -443,16 +574,18 @@ def build_labels(icu, admissions) -> Tuple[Dict, Dict]:
         for r in admissions.iter_rows(named=True):
             expire[int(r["hadm_id"])] = int(r.get("hospital_expire_flag") or 0)
     mort, los = {}, {}
-    has_los = "los" in icu.columns
+    has_los   = "los" in icu.columns
     for r in icu.iter_rows(named=True):
-        icid = int(r["icustay_id"])
+        icid       = int(r["icustay_id"])
         mort[icid] = expire.get(int(r["hadm_id"]), 0)
         los[icid]  = float(r["los"]) if has_los and r["los"] is not None else 0.0
     n_pos = sum(mort.values())
     n     = len(mort)
-    print(f"  Labels      : {n:,} stays | "
-          f"mortality {n_pos:,} ({100*n_pos/max(n,1):.1f}%) | "
-          f"mean LOS {np.mean(list(los.values())):.1f}d")
+    print(
+        f"  Labels      : {n:,} stays | "
+        f"mortality {n_pos:,} ({100*n_pos/max(n,1):.1f}%) | "
+        f"mean LOS {np.mean(list(los.values())):.1f}d"
+    )
     return mort, los
 
 
@@ -461,45 +594,53 @@ def build_labels(icu, admissions) -> Tuple[Dict, Dict]:
 # ---------------------------------------------------------------------------
 def run_etl(
     mimic_dir: str,
-    seq_len:   int  = 48,
+    seq_len:   int  = 128,    # raised from 48 to 128 for timestamp-level seqs
     min_age:   int  = 18,
     save_dir:  Optional[str] = None,
 ) -> Dict:
     """Execute all 8 stages and return the ETL output dict."""
-    from src.data.loader import (load_chartevents, load_labevents, load_icustays,
-                                  load_admissions, load_patients, load_diagnoses)
+    from src.data.loader import (
+        load_chartevents, load_labevents, load_icustays,
+        load_admissions, load_patients, load_diagnoses,
+    )
     print("=" * 55)
     print("[ETL] Loading MIMIC-IV CSV.gz tables …")
-    chart  = load_chartevents(mimic_dir)
-    labs   = load_labevents(mimic_dir)
-    icu    = load_icustays(mimic_dir)
-    adm    = load_admissions(mimic_dir)
-    pat    = load_patients(mimic_dir)
-    diag   = load_diagnoses(mimic_dir)
-    print("[ETL] Running pipeline …")
-    pat    = infer_age(pat, adm)
-    icu    = filter_by_age(icu, pat, min_age)
-    labs   = align_labs(labs, icu)
-        # Defensive: ensure loader outputs are DataFrames (not None)
-    if chart is None:
-        chart = pl.DataFrame()
-    if labs is None:
-        labs = pl.DataFrame()
-    if icu is None:
-        icu = pl.DataFrame()
+    chart = load_chartevents(mimic_dir)
+    labs  = load_labevents(mimic_dir)
+    icu   = load_icustays(mimic_dir)
+    adm   = load_admissions(mimic_dir)
+    pat   = load_patients(mimic_dir)
+    diag  = load_diagnoses(mimic_dir)
 
-    events = merge_events(chart, labs, icu)
-    events = compute_delta_t(events)
-    seqs   = build_sequences(events, seq_len)
-    static = build_static_features(icu, pat, adm, diag)
+    print("[ETL] Running pipeline …")
+    pat   = infer_age(pat, adm)
+    icu   = filter_by_age(icu, pat, min_age)
+    labs  = align_labs(labs, icu)
+
+    if chart is None: chart = pl.DataFrame()
+    if labs  is None: labs  = pl.DataFrame()
+    if icu   is None: icu   = pl.DataFrame()
+
+    events        = merge_events(chart, labs, icu)
+    events        = compute_delta_t(events)
+    seqs          = build_sequences(events, seq_len)
+    static        = build_static_features(icu, pat, adm, diag)
     y_mort, y_los = build_labels(icu, adm)
+
     n = len(set(seqs) & set(y_mort))
     print(f"[ETL] Complete — {n:,} labelled stays ready.")
     print("=" * 55)
 
-    out = dict(sequences=seqs, static_features=static,
-               mortality_labels=y_mort, los_labels=y_los,
-               feature_names=FEATURE_NAMES, static_names=STATIC_NAMES)
+    out = dict(
+        sequences        = seqs,
+        static_features  = static,
+        mortality_labels = y_mort,
+        los_labels       = y_los,
+        feature_names    = FEATURE_NAMES,
+        static_names     = STATIC_NAMES,
+        seq_len          = seq_len,
+        window_hours     = WINDOW_HOURS,
+    )
     if save_dir:
         sp = Path(save_dir)
         sp.mkdir(parents=True, exist_ok=True)
