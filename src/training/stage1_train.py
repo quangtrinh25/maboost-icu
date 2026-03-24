@@ -39,7 +39,7 @@ from src.models.mamba_encoder import DualHeadMamba, _register_nan_hooks
 # ---------------------------------------------------------------------------
 # Losses
 # ---------------------------------------------------------------------------
-
+AUX_WEIGHT = 0.1
 class FocalLoss(nn.Module):
     """FL = −α_t (1−p_t)^γ log(p_t), γ=2 (Lin et al. 2017)"""
     def __init__(self, alpha: torch.Tensor, gamma: float = 2.0):
