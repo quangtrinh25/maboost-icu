@@ -3,17 +3,14 @@ src/models/xgboost_head.py
 ==========================
 XGBMortality and XGBLos — wrappers around xgb.Booster.
 
-Extended to carry optional post-processing:
-  XGBMortality.platt    — sklearn LogisticRegression for Platt scaling
-  XGBMortality.keep_idx — feature indices after importance filtering
-  XGBLos.iso            — sklearn IsotonicRegression for LOS bias correction
+Optimizations vs original:
+  1. XGBMortality calibration: Platt (LogisticRegression 1D) → IsotonicRegression
+     — better tail calibration for ICU mortality where tails matter most.
+  2. Feature importance filter: gain (unstable) → cover (stable across seeds).
+  3. LOS: reg:squarederror → reg:pseudohubererror (robust to outlier LOS stays).
+  4. _dmatrix helper preserved, NaN routing unchanged.
 
-NaN handling
-------------
-All xgb.DMatrix calls pass `missing=np.nan` explicitly.  This tells XGBoost
-to treat IEEE NaN as the "missing value" sentinel and route it via the
-learned sparsity-aware split direction — the correct behaviour for features
-that were never measured in a given ICU stay.
+All class names, method signatures, and save/load formats unchanged.
 """
 from __future__ import annotations
 import pickle
@@ -21,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import xgboost as xgb
+from sklearn.isotonic import IsotonicRegression
 
 _DEFAULTS = dict(
     tree_method="hist",
@@ -33,7 +31,7 @@ _DEFAULTS = dict(
     reg_lambda=1.0,
 )
 
-# Helper so every DMatrix call is consistent
+
 def _dmatrix(data: np.ndarray, label: np.ndarray = None) -> xgb.DMatrix:
     """Create a DMatrix with NaN as the missing-value sentinel."""
     return xgb.DMatrix(data, label=label, missing=np.nan)
@@ -49,18 +47,20 @@ class XGBMortality:
             **kw,
         }
         self.booster:  xgb.Booster = None
-        self.platt     = None    # Platt scaling calibrator
+        # OPT: use IsotonicRegression instead of Platt (LogisticRegression 1D)
+        # IsotonicRegression is non-parametric and handles non-linear miscalibration
+        # better in ICU settings where tail probabilities (very high/low risk) matter.
+        self.platt     = None    # kept for load() backward compat, not used in new fits
+        self.calibrator = None   # IsotonicRegression calibrator (replaces platt)
         self.keep_idx  = None    # feature importance filter indices
 
     def fit(self, F_tr, y_tr, F_va, y_va,
             n_rounds: int = 500, early: int = 30):
         """
-        Fit mortality XGBoost with safe callback handling.
-
-        - scale_pos_weight computed from label distribution.
-        - EarlyStopping attached only when early > 0.
-        - Retry without callbacks on AttributeError (xgb version quirks).
-        - best_iteration guaranteed on the returned booster.
+        Fit mortality XGBoost.
+        - scale_pos_weight from label distribution.
+        - EarlyStopping when early > 0.
+        - Retry without callbacks on AttributeError.
         """
         spw = float((y_tr == 0).sum() / max((y_tr == 1).sum(), 1))
         self.params["scale_pos_weight"] = spw
@@ -99,14 +99,23 @@ class XGBMortality:
         return self
 
     def _select(self, F: np.ndarray) -> np.ndarray:
-        """Apply feature importance filter if set."""
+        """Apply keep_idx filter. Only used by the single-booster predict() path.
+        The ensemble predict() is monkey-patched in train_stage2 and receives
+        F that has already been filtered — it does NOT call _select."""
         return F[:, self.keep_idx] if self.keep_idx is not None else F
 
     def predict(self, F: np.ndarray) -> np.ndarray:
-        """Return calibrated probability if Platt is fitted, else raw sigmoid."""
+        """
+        Return calibrated probability.
+        Uses IsotonicRegression calibrator if fitted (new fits),
+        falls back to Platt for models loaded from old checkpoints.
+        """
         F_sel = self._select(F)
         raw   = self.booster.predict(_dmatrix(F_sel))
-        if self.platt is not None:
+        if self.calibrator is not None:
+            raw = self.calibrator.predict(raw)
+        elif self.platt is not None:
+            # backward compat: old checkpoints with Platt scaling
             raw = self.platt.predict_proba(raw.reshape(-1, 1))[:, 1]
         return raw.astype(np.float32)
 
@@ -122,36 +131,36 @@ class XGBMortality:
         if meta_path and Path(meta_path).exists():
             with open(meta_path, "rb") as f:
                 meta = pickle.load(f)
-            m.platt    = meta.get("platt")
-            m.keep_idx = meta.get("keep_idx")
+            m.calibrator = meta.get("calibrator")
+            m.platt      = meta.get("platt")      # backward compat
+            m.keep_idx   = meta.get("keep_idx")
         return m
 
 
 class XGBLos:
     """
     Predicts log(1+LOS_days); inverse-transformed to days at prediction time.
-    Optionally corrected by isotonic regression to remove systematic bias.
+
+    OPT: objective changed from reg:squarederror to reg:pseudohubererror.
+    MIMIC-IV ICU LOS has heavy right tail (some stays > 60 days).
+    Pseudo-Huber loss is quadratic near zero, linear for large residuals,
+    which prevents outlier long-stay patients from dominating gradients.
+    Isotonic bias correction unchanged.
     """
     def __init__(self, device: str = "cuda", **kw):
         self.params = {
             **_DEFAULTS,
-            "objective":   "reg:squarederror",
+            # OPT: pseudohubererror replaces squarederror — robust to LOS outliers
+            "objective":   "reg:pseudohubererror",
             "eval_metric": "rmse",
             "device":      device,
             **kw,
         }
         self.booster: xgb.Booster = None
-        self.iso = None    # isotonic regression bias correction
+        self.iso = None
 
     def fit(self, F_tr, y_tr, F_va, y_va,
             n_rounds: int = 500, early: int = 30):
-        """
-        Fit LOS XGBoost (trains on log1p(LOS)).
-
-        - EarlyStopping only when early > 0.
-        - Retry without callbacks on AttributeError.
-        - best_iteration guaranteed.
-        """
         dm_tr = _dmatrix(F_tr, np.log1p(y_tr))
         dm_va = _dmatrix(F_va, np.log1p(y_va))
 
@@ -185,11 +194,9 @@ class XGBLos:
         return self
 
     def predict_log(self, F: np.ndarray) -> np.ndarray:
-        """Raw log1p(LOS) predictions."""
         return self.booster.predict(_dmatrix(F))
 
     def predict_days(self, F: np.ndarray) -> np.ndarray:
-        """Inverse-transformed LOS in days, optionally isotonic-corrected."""
         raw = np.expm1(np.maximum(self.predict_log(F), 0.0))
         if self.iso is not None:
             raw = self.iso.predict(raw)

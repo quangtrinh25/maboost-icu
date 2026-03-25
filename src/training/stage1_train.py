@@ -8,7 +8,8 @@ v7 change: added optional auxiliary reconstruction loss from SCI.
   - aux_weight=0.1 (default) — tune down to 0.05 if unstable
   - Disable with aux_weight=0.0
 
-All other logic unchanged from v5/v6.
+Fix: _aux_reconstruction_loss: B,T,F → B,T,n_feat (avoids F shadow).
+All function names and signatures unchanged.
 """
 from __future__ import annotations
 import copy
@@ -26,7 +27,7 @@ from src.models.mamba_encoder import DualHeadMamba, _register_nan_hooks
 
 
 # ---------------------------------------------------------------------------
-# Losses — unchanged
+# Losses
 # ---------------------------------------------------------------------------
 class FocalLoss(nn.Module):
     def __init__(self, alpha: torch.Tensor, gamma: float = 2.0):
@@ -47,7 +48,7 @@ def log_cosh_loss(pred, target):
 
 
 # ---------------------------------------------------------------------------
-# Mixup — unchanged
+# Mixup
 # ---------------------------------------------------------------------------
 
 def mixup_batch(x, tau, mask, y_mort, y_los, x_static=None, alpha=0.4):
@@ -78,7 +79,7 @@ def mixup_batch(x, tau, mask, y_mort, y_los, x_static=None, alpha=0.4):
 
 
 # ---------------------------------------------------------------------------
-# EMA — unchanged
+# EMA
 # ---------------------------------------------------------------------------
 
 class ModelEMA:
@@ -98,7 +99,7 @@ class ModelEMA:
 
 
 # ---------------------------------------------------------------------------
-# LR scheduler — unchanged
+# LR scheduler
 # ---------------------------------------------------------------------------
 
 def _warmup_cosine(step, total, warmup, min_r=0.01):
@@ -109,7 +110,7 @@ def _warmup_cosine(step, total, warmup, min_r=0.01):
 
 
 # ---------------------------------------------------------------------------
-# Evaluation — unchanged
+# Evaluation
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -132,7 +133,7 @@ def _eval(model: DualHeadMamba, loader: DataLoader, device: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Auxiliary reconstruction loss helper  (NEW in v7)
+# Auxiliary reconstruction loss helper
 # ---------------------------------------------------------------------------
 
 def _aux_reconstruction_loss(
@@ -144,52 +145,38 @@ def _aux_reconstruction_loss(
 ) -> torch.Tensor:
     """
     Auxiliary SCI reconstruction loss.
-
     Hold out 20% of observed positions, ask SCI+CCI to reconstruct them.
-    Helps SCI kernel κ learn meaningful clinical interpolation.
-
-    Computes: MSE( x_hat_held , x_original_held )
-    where x_hat_held = CCI(SCI(x_imputed, mask_reduced, tau))
-
-    Returns scalar loss (0.0 if no valid positions).
+    Fix: use n_feat instead of F to avoid shadowing torch.nn.functional.
     """
-    # held_mask: random 20% of observed positions
     held_mask = (mask * (torch.rand_like(mask) < held_rate)).float()
-    mask_reduced = mask * (1.0 - held_mask)    # remove held-out from SCI input
+    mask_reduced = mask * (1.0 - held_mask)
 
     enc = model.encoder
 
-    # GRUDImputer on reduced mask
     if mask_reduced.dim() == 2:
         m3 = mask_reduced.unsqueeze(-1).expand_as(x)
     else:
         m3 = mask_reduced
     x_hat = enc.imputer(x, tau, m3)
 
-    # SCI → CCI with reduced mask
     sigma, lam, gamma = enc.sci(x_hat, m3, tau)
-    chi, _ = enc.cci(sigma, lam, gamma)   # χ is the smooth reconstruction
+    chi, _ = enc.cci(sigma, lam, gamma)
 
-    # chi is on R ref points — we need to map back to T timestamps
-    # Use SCI with reconstruction mode (ref points = observed timestamps)
-    # Simple approach: evaluate kernel at observed timestamps
+    # FIX: n_feat instead of F to avoid shadowing F = nn.functional
     B, T, n_feat = x.shape
     device  = x.device
-    kappa   = torch.nn.functional.softplus(enc.sci.log_kernel)  # (F,)
+    kappa   = torch.nn.functional.softplus(enc.sci.log_kernel)  # (n_feat,)
 
-    t_hours = tau.cumsum(dim=1) / 3600.0   # (B, T)
+    t_hours = tau.cumsum(dim=1) / 3600.0
     ref_t   = torch.linspace(0, enc.sci.window_hours, enc.sci.ref_points, device=device)
 
-    # For each observed held-out timestamp, find nearest ref point and get χ
-    # Simple: use chi evaluated by interpolation back to T timestamps
     dist2 = (t_hours.unsqueeze(2) - ref_t.unsqueeze(0).unsqueeze(0)) ** 2  # (B,T,R)
-    w_back = torch.exp(-kappa.view(1, 1, 1, F) *
-                       dist2.unsqueeze(-1).expand(B, T, enc.sci.ref_points, F))
-    w_sum  = w_back.sum(dim=2).clamp(min=1)                    # (B, T, F)
-    x_recon = (w_back * chi.unsqueeze(1).expand(B, T, enc.sci.ref_points, F)
-               ).sum(dim=2) / w_sum                             # (B, T, F)
+    w_back = torch.exp(-kappa.view(1, 1, 1, n_feat) *
+                       dist2.unsqueeze(-1).expand(B, T, enc.sci.ref_points, n_feat))
+    w_sum  = w_back.sum(dim=2).clamp(min=1)
+    x_recon = (w_back * chi.unsqueeze(1).expand(B, T, enc.sci.ref_points, n_feat)
+               ).sum(dim=2) / w_sum
 
-    # Loss only on held-out observed positions
     if held_mask.dim() == 2:
         hm3 = held_mask.unsqueeze(-1).expand_as(x)
     else:
@@ -202,7 +189,7 @@ def _aux_reconstruction_loss(
 
 
 # ---------------------------------------------------------------------------
-# Main — train_stage1 with aux_weight added
+# Main — train_stage1
 # ---------------------------------------------------------------------------
 
 def train_stage1(
@@ -221,8 +208,8 @@ def train_stage1(
     loss_weight:  float = 0.5,
     use_mixup:    bool  = True,
     mixup_alpha:  float = 0.4,
-    aux_weight:   float = 0.1,    # NEW: weight of SCI reconstruction loss
-    aux_held_rate: float = 0.2,   # NEW: fraction of obs to hold out for aux
+    aux_weight:   float = 0.1,
+    aux_held_rate: float = 0.2,
 ) -> DualHeadMamba:
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
     ckpt  = Path(ckpt_dir) / "encoder_best.pth"
@@ -230,7 +217,6 @@ def train_stage1(
 
     _register_nan_hooks(model)
 
-    # Weight init — skip Mamba internals (unchanged)
     mamba_ids = {id(p) for m in model.modules()
                  if isinstance(m, Mamba) for p in m.parameters()}
     for m in model.modules():
@@ -246,7 +232,6 @@ def train_stage1(
             nn.init.ones_(m.weight)
             nn.init.zeros_(m.bias)
 
-    # Class weights (unchanged)
     ds    = train_loader.dataset
     n_tot = len(ds)
     if hasattr(ds, "mort") and hasattr(ds, "ids"):
@@ -310,10 +295,8 @@ def train_stage1(
             loss_l   = log_cosh_loss(pred_los, torch.log1p(y_los))
             loss     = loss_m + loss_weight * loss_l
 
-            # Auxiliary reconstruction loss (NEW in v7)
             if use_aux:
                 try:
-                    # Use original mask (before mixup if any) for reconstruction
                     mask_3d = mask if mask.dim() == 3 else mask.unsqueeze(-1).expand_as(x)
                     loss_aux = _aux_reconstruction_loss(
                         model, x, tau, mask_3d, held_rate=aux_held_rate
@@ -322,7 +305,7 @@ def train_stage1(
                         loss = loss + aux_weight * loss_aux
                         ep_aux += loss_aux.item()
                 except Exception:
-                    pass   # silently skip aux if it fails (e.g. no observed positions)
+                    pass
 
             if not torch.isfinite(loss):
                 opt.zero_grad(set_to_none=True)

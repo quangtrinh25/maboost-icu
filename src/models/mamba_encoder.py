@@ -2,37 +2,8 @@
 src/models/mamba_encoder.py
 ============================
 MaBoost encoder v7 — GRUDImputer + SCI + CCI + Mamba.
-
-Pipeline change vs v5/v6
---------------------------
-v5/v6:  GRUDImputer → InputProj → MambaBlock×n → pool
-v7:     GRUDImputer → SCI+CCI  → InputProj → MambaBlock×n → pool
-
-GRUDImputer (KEPT):
-  Fill NaN at original T timestamps with time-decayed batch mean.
-  Encoder still sees all T original measurement times.
-  Gradients flow through imputation (end-to-end).
-
-SCI + CCI (NEW, after GRUDImputer):
-  Interpolate the imputed T-timestamp sequence onto R=32 equispaced
-  reference points.  Mamba then processes a REGULAR grid — no more
-  variable gaps confusing the SSM dynamics.
-
-  SCI: per-feature kernel regression → σ (smooth), λ (density), γ (sharp)
-  CCI: cross-feature correlation ρ → χ = Σ ρ·λ·σ / Σ ρ·λ,  τ_res = γ−χ
-  cat [λ, χ, τ_res] → (B, R, 3F) → InputProj → d_model
-
-Why keep GRUDImputer:
-  SCI kernel regression with many missing values becomes noisy.
-  GRUDImputer gives SCI a cleaner, continuously-valued input.
-  The two components are complementary, not redundant.
-
-Feature vector for XGBoost (Stage 2):
-  [z_multi(4·d) | raw_stats_original(5·F) | static(42)]
-  raw_stats computed from ORIGINAL x (before imputation) so XGBoost
-  can use its NaN-aware sparsity splits on never-observed features.
-
-All function names and signatures unchanged from v6.
+Fix: SCI.forward B,T,F → B,T,n_feat (avoids shadowing F=nn.functional).
+All public function names and signatures unchanged.
 """
 from __future__ import annotations
 import math
@@ -45,10 +16,6 @@ import torch.nn.functional as F
 from mamba_ssm import Mamba
 
 
-# ---------------------------------------------------------------------------
-# NaN gradient hook — mandatory for mamba_simple.py
-# ---------------------------------------------------------------------------
-
 def _register_nan_hooks(module: nn.Module) -> None:
     for m in module.modules():
         if isinstance(m, Mamba):
@@ -59,18 +26,7 @@ def _register_nan_hooks(module: nn.Module) -> None:
                 )
 
 
-# ---------------------------------------------------------------------------
-# GRUDImputer — unchanged from v5/v6
-# ---------------------------------------------------------------------------
-
 class GRUDImputer(nn.Module):
-    """
-    γ_j = exp(−softplus(w_j) × τ_hours)
-    x̂_j = mask_j·x_j + (1−mask_j)·(γ_j·x_prev_j + (1−γ_j)·μ_batch_j)
-
-    KEPT in v7: gives SCI a clean, continuously-valued input rather than
-    raw NaN-filled observations. The two components are complementary.
-    """
     def __init__(self, d_input: int):
         super().__init__()
         self.log_w = nn.Parameter(torch.full((d_input,), -3.0))
@@ -85,29 +41,7 @@ class GRUDImputer(nn.Module):
         return mask * x + (1.0 - mask) * (gamma * x + (1.0 - gamma) * x_mean)
 
 
-# ---------------------------------------------------------------------------
-# SCI — Single Channel Interpolation  (NEW in v7)
-# ---------------------------------------------------------------------------
-
 class SCI(nn.Module):
-    """
-    Single Channel Interpolation (Shukla & Marlin, ICLR 2019).
-
-    Maps T-timestamp sequence → R equispaced reference points via kernel regression.
-
-    For each reference point r and feature j:
-        w_lp(t,r) = exp(−κ_j · (t−r)²) · mask_j(t)
-        w_hp(t,r) = exp(−10·κ_j · (t−r)²) · mask_j(t)
-
-        σ_j(r) = Σ_t w_lp·x̂_j / Σ_t w_lp   (smooth interpolation)
-        γ_j(r) = Σ_t w_hp·x̂_j / Σ_t w_hp   (sharp interpolation)
-        λ_j(r) = Σ_t w_lp                    (observation density at r)
-
-    κ_j = softplus(log_kernel_j) > 0 — learned per-feature bandwidth.
-
-    Input x̂ is the GRUDImputer output (no NaN) so kernel sums are stable.
-    mask still controls which original timestamps contributed real data.
-    """
     def __init__(self, n_feat: int, ref_points: int = 32,
                  window_hours: float = 48.0):
         super().__init__()
@@ -117,81 +51,55 @@ class SCI(nn.Module):
 
     def forward(
         self,
-        x_hat: torch.Tensor,   # (B, T, F) — GRUDImputer output (no NaN)
-        mask:  torch.Tensor,   # (B, T, F) — original observation mask
-        tau:   torch.Tensor,   # (B, T)    — seconds since previous obs
+        x_hat: torch.Tensor,
+        mask:  torch.Tensor,
+        tau:   torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (σ, λ, γ) each (B, R, F)."""
-        # FIX: đổi F → n_feat để tránh shadow `import torch.nn.functional as F`
+        # FIX: n_feat instead of F to avoid shadowing torch.nn.functional
         B, T, n_feat = x_hat.shape
         device  = x_hat.device
-        kappa   = F.softplus(self.log_kernel)   # (F,)
+        kappa   = F.softplus(self.log_kernel)   # (n_feat,)
 
-        # Cumulative time in hours — (B, T)
         t_hours = tau.cumsum(dim=1) / 3600.0
-
-        # R equispaced reference points in [0, window_hours] — (B, R)
         ref_t = torch.linspace(
             0, self.window_hours, self.ref_points, device=device
         ).unsqueeze(0).expand(B, -1)
 
-        # Pairwise squared distances (B, T, R) → expand to (B, T, R, F)
-        dist2  = (t_hours.unsqueeze(2) - ref_t.unsqueeze(1)) ** 2   # (B, T, R)
+        dist2  = (t_hours.unsqueeze(2) - ref_t.unsqueeze(1)) ** 2
         dist2F = dist2.unsqueeze(-1).expand(B, T, self.ref_points, n_feat)
         kappa4 = kappa.view(1, 1, 1, n_feat)
         maskF  = mask.unsqueeze(2).expand(B, T, self.ref_points, n_feat)
         x4     = x_hat.unsqueeze(2).expand(B, T, self.ref_points, n_feat)
 
-        w_lp = torch.exp(-kappa4 * dist2F) * maskF          # (B,T,R,F)
-        w_hp = torch.exp(-10.0 * kappa4 * dist2F) * maskF   # (B,T,R,F)
+        w_lp = torch.exp(-kappa4 * dist2F) * maskF
+        w_hp = torch.exp(-10.0 * kappa4 * dist2F) * maskF
 
-        lam   = w_lp.sum(dim=1)                               # (B,R,F)
-        sigma = (w_lp * x4).sum(dim=1) / lam.clamp(min=1)    # (B,R,F)
+        lam   = w_lp.sum(dim=1)
+        sigma = (w_lp * x4).sum(dim=1) / lam.clamp(min=1)
         gamma = (w_hp * x4).sum(dim=1) / w_hp.sum(dim=1).clamp(min=1)
 
         return sigma, lam, gamma
 
 
-# ---------------------------------------------------------------------------
-# CCI — Cross Channel Interpolation  (NEW in v7)
-# ---------------------------------------------------------------------------
-
 class CCI(nn.Module):
-    """
-    Cross Channel Interpolation (Shukla & Marlin, ICLR 2019).
-
-    Learnable F×F correlation matrix ρ fuses smooth signals across features.
-    Captures: SBP↔DBP, HR↔SpO2, creatinine↔BUN correlations.
-
-    χ_j(r) = Σ_k ρ_jk·λ_k·σ_k / Σ_k ρ_jk·λ_k
-    τ_res   = γ − χ   (residual high-frequency detail)
-
-    Init: ρ = eye(F) → no cross-channel effect at start, learned gradually.
-    """
     def __init__(self, n_feat: int):
         super().__init__()
         self.rho = nn.Parameter(torch.eye(n_feat).unsqueeze(0).unsqueeze(0))
 
     def forward(
         self,
-        sigma: torch.Tensor,  # (B, R, F)
-        lam:   torch.Tensor,  # (B, R, F)
-        gamma: torch.Tensor,  # (B, R, F)
+        sigma: torch.Tensor,
+        lam:   torch.Tensor,
+        gamma: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns (χ, τ_res) each (B, R, F)."""
-        # rho: (1,1,F,F)  sigma/lam: (B,R,F) → unsqueeze → (B,R,F,1)
-        sigma4 = sigma.unsqueeze(-1)   # (B,R,F,1)
-        lam4   = lam.unsqueeze(-1)     # (B,R,F,1)
-        num    = (self.rho * lam4 * sigma4).sum(dim=-2)   # (B,R,F)
-        den    = (self.rho * lam4).sum(dim=-2).clamp(1)   # (B,R,F)
+        sigma4 = sigma.unsqueeze(-1)
+        lam4   = lam.unsqueeze(-1)
+        num    = (self.rho * lam4 * sigma4).sum(dim=-2)
+        den    = (self.rho * lam4).sum(dim=-2).clamp(1)
         chi    = num / den
         tau_res = gamma - chi
         return chi, tau_res
 
-
-# ---------------------------------------------------------------------------
-# TimeEmbedding — unchanged from v6
-# ---------------------------------------------------------------------------
 
 class TimeEmbedding(nn.Module):
     def __init__(self, d_out: int, use_circadian: bool = True):
@@ -220,10 +128,6 @@ class TimeEmbedding(nn.Module):
         return out
 
 
-# ---------------------------------------------------------------------------
-# MambaBlock — unchanged from v6
-# ---------------------------------------------------------------------------
-
 class MambaBlock(nn.Module):
     def __init__(self, d_model: int, d_state: int = 16,
                  d_conv: int = 4, expand: int = 2, dropout: float = 0.1):
@@ -240,10 +144,6 @@ class MambaBlock(nn.Module):
         gate  = torch.exp(-F.softplus(self.log_decay) * tau_h)
         return x + self.drop(h * gate)
 
-
-# ---------------------------------------------------------------------------
-# MultiResolutionPooling — unchanged from v6
-# ---------------------------------------------------------------------------
 
 class MultiResolutionPooling(nn.Module):
     def __init__(self, d: int):
@@ -282,34 +182,10 @@ class MultiResolutionPooling(nn.Module):
         return torch.cat([h_last, h_mean, h_max, h_attn], dim=-1)
 
 
-# ---------------------------------------------------------------------------
-# MambaEncoder — pipeline updated, all public signatures unchanged
-# ---------------------------------------------------------------------------
-
 class MambaEncoder(nn.Module):
     """
     ICU encoder v7: x(B,T,F), tau(B,T) → z_T(B,d)
-
-    Pipeline
-    --------
-    GRUDImputer  → x̂ (B,T,F) no NaN, still T irregular timestamps
-    SCI          → σ,λ,γ (B,R,F) on R equispaced reference points
-    CCI          → χ,τ_res (B,R,F) cross-feature fusion
-    cat[λ,χ,τ_res] → (B,R,3F)
-    InputProj    → Linear(3F→d) + LayerNorm
-    TimeFuse     → concat([proj, TimeEmb(τ_ref)]) → Linear(2d→d) → (B,R,d)
-    MambaBlock×n → regular grid (uniform R-point spacing)
-    LayerNorm    → stable activations
-    nan_to_num   → guard
-    MultiResPool → z_T (Stage 1) / z_multi (Stage 2)
-
-    XGBoost feature vector:
-    [z_multi(4d) | raw_stats_from_original_x(5F) | static(42)]
-
-    raw_stats from ORIGINAL x (before GRUDImputer) — preserves NaN so
-    XGBoost can use sparsity-aware splits on never-observed features.
-
-    Public API identical to v6 — only _encode() internals changed.
+    Public API identical to v6.
     """
     def __init__(self, d_input: int, d_model: int = 128, d_state: int = 16,
                  d_conv: int = 4, expand: int = 2, n_layers: int = 3,
@@ -320,23 +196,14 @@ class MambaEncoder(nn.Module):
         self.d_input    = d_input
         self.ref_points = ref_points
 
-        # Tầng 1: GRUDImputer (KEPT from v5/v6)
-        self.imputer = GRUDImputer(d_input)
-
-        # Tầng 2: SCI + CCI (NEW in v7)
-        self.sci = SCI(d_input, ref_points, window_hours)
-        self.cci = CCI(d_input)
-
-        # Tầng 3: Input projection — now 3F input (λ, χ, τ_res)
+        self.imputer    = GRUDImputer(d_input)
+        self.sci        = SCI(d_input, ref_points, window_hours)
+        self.cci        = CCI(d_input)
         self.input_proj = nn.Sequential(
             nn.Linear(d_input * 3, d_model), nn.LayerNorm(d_model)
         )
-
-        # Tầng 4: TimeEmbedding on regular ref grid
         self.t_emb  = TimeEmbedding(d_model, use_circadian=use_circadian)
         self.t_fuse = nn.Linear(d_model * 2, d_model)
-
-        # Tầng 5: Mamba layers (unchanged)
         self.layers = nn.ModuleList([
             MambaBlock(d_model, d_state, d_conv, expand, dropout)
             for _ in range(n_layers)
@@ -344,37 +211,24 @@ class MambaEncoder(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.pool = MultiResolutionPooling(d_model)
 
-    # ── Public API (unchanged signatures) ──────────────────────────────
-
     def forward(self, x: torch.Tensor, tau: torch.Tensor,
                 mask: Optional[torch.Tensor] = None,
                 t_abs: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Stage 1: returns z_T (B, d_model)."""
         h = self._encode(x, tau, mask, t_abs)
-        return self.pool(h, mask=None)   # regular grid — no padding mask
+        return self.pool(h, mask=None)
 
     def extract_features(self, x: torch.Tensor, tau: torch.Tensor,
                          mask: Optional[torch.Tensor] = None,
                          t_abs: Optional[torch.Tensor] = None,
                          ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Stage 2: returns (z_multi, raw_stats). Unchanged signature."""
         h         = self._encode(x, tau, mask, t_abs)
         z_multi   = self.pool.extract(h, mask=None)
-        raw_stats = self._raw_stats(x, mask)   # from original x
+        raw_stats = self._raw_stats(x, mask)
         return z_multi, raw_stats
-
-    # ── Internal ────────────────────────────────────────────────────────
 
     def _encode(self, x: torch.Tensor, tau: torch.Tensor,
                 mask: Optional[torch.Tensor],
                 t_abs: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        v7 pipeline:
-          x → GRUDImputer → x̂ (T timestamps, no NaN)
-          x̂ + mask → SCI → σ,λ,γ (R ref points)
-          σ,λ,γ → CCI → χ,τ_res
-          cat[λ,χ,τ_res] → InputProj → TimeFuse → MambaBlock×n → norm
-        """
         if mask is None:
             mask_3d = torch.ones_like(x)
         elif mask.dim() == 2:
@@ -382,23 +236,16 @@ class MambaEncoder(nn.Module):
         else:
             mask_3d = mask
 
-        # Step 1: GRUDImputer (fill NaN at original timestamps)
-        x_hat = self.imputer(x, tau, mask_3d)   # (B, T, F) — no NaN
+        x_hat = self.imputer(x, tau, mask_3d)
+        sigma, lam, gamma = self.sci(x_hat, mask_3d, tau)
+        chi, tau_res = self.cci(sigma, lam, gamma)
 
-        # Step 2: SCI — interpolate to R regular ref points
-        sigma, lam, gamma = self.sci(x_hat, mask_3d, tau)  # each (B, R, F)
-
-        # Step 3: CCI — cross-feature fusion
-        chi, tau_res = self.cci(sigma, lam, gamma)           # each (B, R, F)
-
-        # Step 4: cat [λ, χ, τ_res] → InputProj
-        sci_out = torch.cat([lam, chi, tau_res], dim=-1)     # (B, R, 3F)
+        sci_out = torch.cat([lam, chi, tau_res], dim=-1)
         h = self.t_fuse(torch.cat([
-            self.input_proj(sci_out),                        # (B, R, d)
-            self.t_emb(self._ref_tau(tau)),                  # (B, R, d)
-        ], dim=-1))                                          # (B, R, d)
+            self.input_proj(sci_out),
+            self.t_emb(self._ref_tau(tau)),
+        ], dim=-1))
 
-        # Step 5: Mamba on regular grid
         ref_tau = self._ref_tau(tau)
         for layer in self.layers:
             h = layer(h, ref_tau)
@@ -407,7 +254,6 @@ class MambaEncoder(nn.Module):
         return torch.nan_to_num(h, nan=0.0, posinf=1.0, neginf=-1.0)
 
     def _ref_tau(self, tau: torch.Tensor) -> torch.Tensor:
-        """Uniform tau for regular R-point grid: dt = 48h/R seconds."""
         B  = tau.shape[0]
         dt = 48.0 * 3600.0 / self.ref_points
         return torch.full((B, self.ref_points), dt,
@@ -415,11 +261,6 @@ class MambaEncoder(nn.Module):
 
     def _raw_stats(self, x: torch.Tensor,
                    mask: Optional[torch.Tensor]) -> torch.Tensor:
-        """
-        Per-feature stats from ORIGINAL x (before GRUDImputer).
-        NaN for never-observed features → XGBoost sparsity routing.
-        Unchanged from v5/v6.
-        """
         B, L, F = x.shape
         if mask is None:
             m3 = torch.ones_like(x)
@@ -455,10 +296,6 @@ class MambaEncoder(nn.Module):
 
         return torch.cat([last_val, mean_val, max_val, std_val, miss_r], dim=-1)
 
-
-# ---------------------------------------------------------------------------
-# DualHeadMamba — Stage 1 training wrapper (unchanged from v6)
-# ---------------------------------------------------------------------------
 
 class DualHeadMamba(nn.Module):
     def __init__(self, d_input: int, d_model: int = 128,
