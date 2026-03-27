@@ -40,6 +40,7 @@ from river import metrics as river_metrics
 
 from src.models.mamba_encoder import MambaEncoder
 from src.models.xgboost_head  import XGBMortality, XGBLos
+from src.training.stage2_train import apply_stage2_transforms
 
 
 class MaBoostOnlinePipeline:
@@ -79,6 +80,37 @@ class MaBoostOnlinePipeline:
         self.auc_history:  List[float] = []
         self.n_updates     = 0
         self._hist: Dict[str, deque] = {}
+        self.ckpt_dir: str | None = None
+
+    # ------------------------------------------------------------------
+    def _build_feature_vector(
+        self,
+        stay_id: str,
+        x_new: np.ndarray,
+        tau_new: float,
+        x_static: np.ndarray,
+    ) -> np.ndarray:
+        if stay_id not in self._hist:
+            self._hist[stay_id] = deque(maxlen=self.history_len)
+        self._hist[stay_id].append((x_new.ravel().astype(np.float32), tau_new))
+
+        hist = list(self._hist[stay_id])
+        seq  = np.stack([h[0] for h in hist]).astype(np.float32)
+        taus = np.array([h[1] for h in hist], dtype=np.float32)
+
+        with torch.no_grad():
+            xt     = torch.from_numpy(seq).float().unsqueeze(0).to(self.device)
+            tt     = torch.from_numpy(taus).float().unsqueeze(0).to(self.device)
+            # All rows in history are real observed timesteps.
+            mask_t = torch.ones(1, len(hist), dtype=torch.float32).to(self.device)
+            z_multi, raw_stats = self.enc.extract_features(xt, tt, mask_t)
+
+        F_base = np.hstack([
+            z_multi.cpu().numpy(),
+            raw_stats.cpu().numpy(),
+            x_static.reshape(1, -1),
+        ]).astype(np.float32)
+        return F_base
 
     # ------------------------------------------------------------------
     def predict(self, stay_id: str, x_new: np.ndarray,
@@ -91,39 +123,47 @@ class MaBoostOnlinePipeline:
         Trước đây enc(xt,tt) trả về z_T (d_model-dim = 128) nhưng
         XGBoost train trên 1010-dim → crash hoặc garbage predictions.
         """
-        if stay_id not in self._hist:
-            self._hist[stay_id] = deque(maxlen=self.history_len)
-        self._hist[stay_id].append((x_new.ravel().astype(np.float32), tau_new))
+        F_base = self._build_feature_vector(stay_id, x_new, tau_new, x_static)
+        F_mort = F_base
+        F_los = F_base
+        if self.ckpt_dir:
+            F_mort = apply_stage2_transforms(F_base, self.ckpt_dir, for_mortality=True)
+            F_los = apply_stage2_transforms(F_base, self.ckpt_dir, for_mortality=False)
 
-        hist = list(self._hist[stay_id])
-        seq  = np.stack([h[0] for h in hist]).astype(np.float32)
-        taus = np.array([h[1] for h in hist], dtype=np.float32)
-
-        with torch.no_grad():
-            xt     = torch.from_numpy(seq).float().unsqueeze(0).to(self.device)
-            tt     = torch.from_numpy(taus).float().unsqueeze(0).to(self.device)
-            # FIX 4: mask cho các timestep thật (tất cả = 1 vì đây là live data)
-            mask_t = torch.ones(1, len(hist), dtype=torch.float32).to(self.device)
-            # FIX 4: dùng extract_features() trả về (z_multi, raw_stats)
-            z_multi, raw_stats = self.enc.extract_features(xt, tt, mask_t)
-
-        # FIX 4: ghép đúng thứ tự như Stage 2 extract_features()
-        F = np.hstack([
-            z_multi.cpu().numpy(),
-            raw_stats.cpu().numpy(),
-            x_static.reshape(1, -1),
-        ]).astype(np.float32)
-
-        mort_risk = float(self.xgb_mort.predict(F)[0])
-        los_days  = float(self.xgb_los.predict_days(F)[0])
+        mort_risk = float(self.xgb_mort.predict(F_mort)[0])
+        los_days  = float(self.xgb_los.predict_days(F_los)[0])
         level     = next(lbl for thr, lbl in self._RISK if mort_risk < thr)
         return {"mortality_risk": round(mort_risk, 4),
                 "los_days":       round(max(los_days, 0), 2),
                 "risk_level":     level}
 
     # ------------------------------------------------------------------
+    def predict_with_features(
+        self, stay_id: str, x_new: np.ndarray, tau_new: float, x_static: np.ndarray
+    ) -> tuple[Dict, np.ndarray]:
+        """
+        Same as predict(), but also returns the 2D feature matrix (1, D)
+        used by XGBoost. Useful for online incremental update buffers.
+        """
+        F_base = self._build_feature_vector(stay_id, x_new, tau_new, x_static)
+        F_mort = F_base
+        F_los = F_base
+        if self.ckpt_dir:
+            F_mort = apply_stage2_transforms(F_base, self.ckpt_dir, for_mortality=True)
+            F_los = apply_stage2_transforms(F_base, self.ckpt_dir, for_mortality=False)
+        mort_risk = float(self.xgb_mort.predict(F_mort)[0])
+        los_days  = float(self.xgb_los.predict_days(F_los)[0])
+        level     = next(lbl for thr, lbl in self._RISK if mort_risk < thr)
+        out = {
+            "mortality_risk": round(mort_risk, 4),
+            "los_days": round(max(los_days, 0), 2),
+            "risk_level": level,
+        }
+        return out, F_base
+
+    # ------------------------------------------------------------------
     def update(self, F_new: np.ndarray, y_new: np.ndarray,
-               yl_new: np.ndarray) -> str:
+               yl_new: np.ndarray, F_new_los: np.ndarray | None = None) -> str:
         """
         Receive discharge batch, update rolling AUC, apply drift strategy.
 
@@ -139,8 +179,9 @@ class MaBoostOnlinePipeline:
         FIX 2 — LOS model updated alongside mortality model in every
                  drift state (severe and mild) so LOS drift is corrected too.
         """
+        F_los = F_new if F_new_los is None else F_new_los
         dm_m = xgb.DMatrix(F_new, label=y_new,            missing=np.nan)
-        dm_l = xgb.DMatrix(F_new, label=np.log1p(yl_new), missing=np.nan)
+        dm_l = xgb.DMatrix(F_los, label=np.log1p(yl_new), missing=np.nan)
 
         # Update rolling AUC tracker
         pred = self.xgb_mort.booster.predict(dm_m)
@@ -245,4 +286,20 @@ class MaBoostOnlinePipeline:
             meta_path=str(p / "los_meta.pkl"),
         )
         print(f"[Online] Loaded from {ckpt_dir}")
-        return cls(enc, xgb_m, xgb_l, device=device)
+        obj = cls(enc, xgb_m, xgb_l, device=device)
+        obj.ckpt_dir = str(p)
+        meta_path = p / "stage2_meta.pkl"
+        if not meta_path.exists():
+            # Backward compatibility guard: old checkpoints may have
+            # transformed-feature boosters but no transform metadata.
+            base_dim_est = 4 * d_model + 5 * d_input + 42
+            n_feat_m = int(xgb_m.booster.num_features())
+            n_feat_l = int(xgb_l.booster.num_features())
+            if n_feat_m != base_dim_est or n_feat_l != base_dim_est:
+                raise RuntimeError(
+                    "Missing stage2_meta.pkl for transformed Stage-2 features. "
+                    f"Checkpoint expects mort={n_feat_m}, los={n_feat_l} features, "
+                    f"but online base features are {base_dim_est}. "
+                    "Please retrain Stage 2 with the updated code to export transform metadata."
+                )
+        return obj

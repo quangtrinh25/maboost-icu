@@ -26,13 +26,11 @@ Fixes vs previous version
 7. Duplicate z_T block removed; single block placed before run_shap().
 8. cfg["device"] → s1["device"] (cfg has no top-level "device" key).
 9. All new stage2 params forwarded from config (interactions, ensemble, cross).
-v7 fixes:
-10. SHAP: load keep_idx_for_shap from mort_meta.pkl (xgb_mort.keep_idx is now None).
-11. SHAP: pad interaction feature names when F_te_final has more cols than feat_names.
-12. n_ensemble_mort default in train_stage2 call changed 2→1.
 """
 from __future__ import annotations
 import argparse, pickle
+import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -46,8 +44,11 @@ from src.data.dataset         import make_loaders
 from src.models.mamba_encoder import DualHeadMamba, MambaEncoder
 from src.models.xgboost_head  import XGBMortality, XGBLos
 from src.training.stage1_train import train_stage1
-from src.training.stage2_train import load_frozen_encoder, extract_features, train_stage2
+from src.training.stage2_train import (
+    load_frozen_encoder, extract_features, train_stage2, apply_stage2_transforms
+)
 from src.inference.offline_pipeline import OfflineBenchmark, BenchResult
+from src.inference.online_pipeline import MaBoostOnlinePipeline
 from src.visualization.training_plots import save_all
 from src.visualization.shap_explain   import run_shap, build_feature_names
 
@@ -55,6 +56,133 @@ from src.visualization.shap_explain   import run_shap, build_feature_names
 def load_cfg(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def _online_loop(cfg: dict, event_file: str, poll_seconds: float = 0.25) -> None:
+    """
+    Simple online service loop over JSONL events.
+
+    Each line in `event_file` should be a JSON object with at least:
+      {
+        "type": "observation",
+        "stay_id": "12345",
+        "x_new": [...],          # time-series feature vector
+        "tau_new": 300.0,        # seconds since previous event
+        "x_static": [...]        # static vector
+      }
+
+    Optional label/update event:
+      {
+        "type": "label",
+        "stay_id": "12345",
+        "y_mort": 0 or 1,
+        "y_los": 3.25
+      }
+    """
+    ckpt_dir = cfg["ckpt_dir"]
+    m = cfg["model"]
+    s1 = cfg["stage1"]
+    online_cfg = cfg.get("online", {})
+    history_len = int(online_cfg.get("history_len", cfg["data"].get("seq_len", 128)))
+    thresh_mild = float(online_cfg.get("thresh_mild", 0.05))
+    thresh_severe = float(online_cfg.get("thresh_severe", 0.10))
+    flush_every = int(online_cfg.get("update_flush_every", 32))
+
+    enc_kw = dict(
+        d_state=m["d_state"],
+        n_layers=m.get("n_layers", 3),
+        n_heads=m["n_heads"],
+        dropout=m["dropout"],
+        topk=m.get("topk", 5),
+    )
+    if "ref_points" in m:
+        enc_kw["ref_points"] = m["ref_points"]
+
+    pipe = MaBoostOnlinePipeline.load(
+        ckpt_dir=ckpt_dir,
+        d_input=int(online_cfg.get("d_input", 40)),
+        d_model=m["d_model"],
+        device=s1["device"],
+        **enc_kw,
+    )
+    pipe.history_len = history_len
+    pipe.thresh_mild = thresh_mild
+    pipe.thresh_severe = thresh_severe
+
+    pending_feats = {}  # stay_id -> latest (1, D) feature matrix
+    update_F_m, update_F_l, update_y, update_los = [], [], [], []
+    ef = Path(event_file)
+    ef.parent.mkdir(parents=True, exist_ok=True)
+    ef.touch(exist_ok=True)
+
+    print(f"[Online] Watching event stream: {ef}")
+    print("[Online] Ctrl+C to stop")
+
+    with ef.open("r") as f:
+        f.seek(0, 2)
+        while True:
+            line = f.readline()
+            if not line:
+                time.sleep(poll_seconds)
+                continue
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"[Online] skip malformed JSON: {line[:100]}")
+                continue
+
+            etype = str(evt.get("type", "observation"))
+            stay_id = str(evt.get("stay_id", ""))
+            if not stay_id:
+                print("[Online] skip event without stay_id")
+                continue
+
+            if etype == "observation":
+                x_new = np.asarray(evt.get("x_new", []), dtype=np.float32)
+                tau_new = float(evt.get("tau_new", 60.0))
+                x_static = np.asarray(evt.get("x_static", []), dtype=np.float32)
+                pred, F_cur = pipe.predict_with_features(stay_id, x_new, tau_new, x_static)
+                F_cur_m = apply_stage2_transforms(F_cur, ckpt_dir=ckpt_dir, for_mortality=True)
+                F_cur_l = apply_stage2_transforms(F_cur, ckpt_dir=ckpt_dir, for_mortality=False)
+                pending_feats[stay_id] = (F_cur_m, F_cur_l)
+                print(
+                    f"[Online] stay={stay_id} risk={pred['mortality_risk']:.4f} "
+                    f"los={pred['los_days']:.2f}d level={pred['risk_level']}"
+                )
+            elif etype == "label":
+                if stay_id not in pending_feats:
+                    print(f"[Online] label arrived but no cached feature for stay={stay_id}")
+                    continue
+                if "y_mort" not in evt or "y_los" not in evt:
+                    print(f"[Online] skip label without y_mort/y_los for stay={stay_id}")
+                    continue
+                f_m, f_l = pending_feats[stay_id]
+                update_F_m.append(f_m[0])
+                update_F_l.append(f_l[0])
+                update_y.append(int(evt["y_mort"]))
+                update_los.append(float(evt["y_los"]))
+                print(f"[Online] queued label for stay={stay_id} ({len(update_y)}/{flush_every})")
+
+                if len(update_y) >= flush_every:
+                    F_new_m = np.asarray(update_F_m, dtype=np.float32)
+                    F_new_l = np.asarray(update_F_l, dtype=np.float32)
+                    y_new = np.asarray(update_y, dtype=np.int32)
+                    yl_new = np.asarray(update_los, dtype=np.float32)
+                    drift = pipe.update(F_new_m, y_new, yl_new, F_new_los=F_new_l)
+                    print(f"[Online] model update applied with drift={drift}")
+                    update_F_m.clear()
+                    update_F_l.clear()
+                    update_y.clear()
+                    update_los.clear()
+            elif etype == "discharge":
+                pipe.discharge(stay_id)
+                pending_feats.pop(stay_id, None)
+                print(f"[Online] discharged stay={stay_id}")
+            else:
+                print(f"[Online] unknown event type={etype} (ignored)")
 
 
 def main():
@@ -65,16 +193,43 @@ def main():
                     help="Skip deep learning baselines (GRU-D, LSTM, etc.)")
     pa.add_argument("--skip-new-tests", action="store_true",
                     help="Skip early/sparse/rolling prediction tests")
+    pa.add_argument("--mode", choices=["offline", "online_service"], default="offline")
+    pa.add_argument("--event-file", default=None,
+                    help="Path to JSONL stream file for --mode online_service")
+    pa.add_argument("--poll-seconds", type=float, default=0.25,
+                    help="Tail polling interval for online service")
+    pa.add_argument("--fixed_48h", action="store_true",
+                    help="Use fixed first-48h ETL window for offline training/eval")
+    pa.add_argument("--expanding_window", action="store_true",
+                    help="Use full-stay ETL window for offline training/eval")
     args = pa.parse_args()
     cfg  = load_cfg(args.config)
     np.random.seed(cfg["seed"])
     torch.manual_seed(cfg["seed"])
 
+    if args.mode == "online_service":
+        event_file = args.event_file or cfg.get("online", {}).get(
+            "event_file", str(Path(cfg["results_dir"]) / "online_events.jsonl")
+        )
+        _online_loop(cfg, event_file, poll_seconds=args.poll_seconds)
+        return
+
+    if args.fixed_48h and args.expanding_window:
+        raise ValueError("Choose only one of --fixed_48h or --expanding_window")
+    if args.expanding_window:
+        window_mode = "expanding_window"
+    elif args.fixed_48h:
+        window_mode = "fixed_48h"
+    else:
+        window_mode = cfg.get("data", {}).get("window_mode", "fixed_48h")
+    window_hours = float(cfg["data"].get("window_hours", 48.0))
+    suffix = "expanding" if window_mode == "expanding_window" else "fixed48"
+
     Path(cfg["results_dir"]).mkdir(parents=True, exist_ok=True)
     Path(cfg["ckpt_dir"]).mkdir(parents=True, exist_ok=True)
 
     # ── 1. ETL ──────────────────────────────────────────────────────────
-    etl_cache = Path(cfg["data"]["processed"]) / "etl_output.pkl"
+    etl_cache = Path(cfg["data"]["processed"]) / f"etl_output_{suffix}.pkl"
     if args.skip_etl and etl_cache.exists():
         etl = load_etl_output(str(etl_cache))
     else:
@@ -82,6 +237,8 @@ def main():
             mimic_dir = cfg["data"]["mimic_dir"],
             seq_len   = cfg["data"]["seq_len"],
             min_age   = cfg["data"]["min_age"],
+            window_mode = window_mode,
+            window_hours = window_hours,
             save_dir  = cfg["data"]["processed"],
         )
 
@@ -90,8 +247,10 @@ def main():
     ts_names      = etl["feature_names"]   # 40 time-series feature names
     st_names      = etl["static_names"]    # 42 static feature names
     d_input       = len(ts_names)
+    # FIX 5: cfg is a dict — use cfg["model"]["d_model"], not cfg.model.d_model
     d_model       = cfg["model"]["d_model"]
 
+    # FIX 1 — feat_names: 4*d_model + 5*d_input + len(st_names)
     feat_names = (
         [f"h_last_{i}"  for i in range(d_model)] +
         [f"h_mean_{i}"  for i in range(d_model)] +
@@ -128,6 +287,7 @@ def main():
         random_state=cfg["seed"],
     )
 
+    # Save split IDs
     splits_dir = Path(cfg["data"]["splits"])
     splits_dir.mkdir(parents=True, exist_ok=True)
     for name, ids in [("train", tr_ids), ("val", va_ids), ("test", te_ids)]:
@@ -150,6 +310,9 @@ def main():
         dropout   = m["dropout"],
         topk      = m.get("topk", 5),
     )
+    if "ref_points" in m:
+        enc_kw["ref_points"] = m["ref_points"]
+    # FIX 6: d_static computed here; used later for n_static_dims in train_stage2
     d_static = next(iter(static.values())).shape[0] if static else 0
     model    = DualHeadMamba(
         d_input=d_input, d_model=d_model,
@@ -157,13 +320,13 @@ def main():
     )
     model = train_stage1(
         model, tr_loader, va_loader,
-        epochs        = s1["epochs"],
-        lr            = s1["lr"],
-        patience      = s1["patience"],
-        clip_norm     = s1["clip_norm"],
-        ckpt_dir      = cfg["ckpt_dir"],
-        device        = s1["device"],
-        aux_weight    = s1.get("aux_weight",    0.1),
+        epochs     = s1["epochs"],
+        lr         = s1["lr"],
+        patience   = s1["patience"],
+        clip_norm  = s1["clip_norm"],
+        ckpt_dir   = cfg["ckpt_dir"],
+        device     = s1["device"],
+        aux_weight = s1.get("aux_weight",    0.1),
         aux_held_rate = s1.get("aux_held_rate", 0.2),
     )
 
@@ -172,6 +335,7 @@ def main():
     enc       = load_frozen_encoder(ckpt_path, d_input, d_model, **enc_kw)
     s2        = cfg["stage2"]
 
+    # OPT-7: optional encoder fine-tune before feature extraction
     finetune_epochs = s2.get("finetune_enc_epochs", 0)
     if finetune_epochs > 0:
         from src.training.stage2_train import _finetune_encoder
@@ -186,7 +350,7 @@ def main():
     F_va, ym_va, yl_va = extract_features(enc, va_loader, s1["device"])
     F_te, ym_te, yl_te = extract_features(enc, te_loader, s1["device"])
 
-    xgb_mort, xgb_los, F_te_final = train_stage2(
+    xgb_mort, xgb_los, F_te_mort, F_te_los = train_stage2(
         F_tr, ym_tr, yl_tr,
         F_va, ym_va, yl_va,
         F_te             = F_te,
@@ -208,21 +372,26 @@ def main():
         use_calibration      = s2.get("use_calibration",       True),
         use_isotonic         = s2.get("use_isotonic",          True),
         drop_low_importance  = s2.get("drop_low_importance",   True),
+        # OPT-4: interaction features
         use_interaction_features = s2.get("use_interaction_features", True),
         n_interaction_top        = s2.get("n_interaction_top",        8),
-        # FIX 12: default changed 2→1 (config should also set n_ensemble_mort: 1)
-        n_ensemble_mort          = s2.get("n_ensemble_mort",          1),
+        # OPT-5: mortality ensemble
+        n_ensemble_mort          = s2.get("n_ensemble_mort",          2),
+        # OPT-6: static × z_multi cross features
+        # FIX 5+6: cfg["model"]["d_model"] and d_static (not cfg.model / x_static)
         use_static_cross         = s2.get("use_static_cross",         True),
-        n_zmulti_dims            = 4 * d_model,
-        n_static_dims            = d_static,
-        keep_frac                = s2.get("keep_frac",                0.80),
+        n_zmulti_dims            = 4 * d_model,   # 4 * d_model from cfg["model"]["d_model"]
+        n_static_dims            = d_static,       # computed above from static features
     )
 
     # ── 5. MaBoost predictions on test set ───────────────────────────────
-    y_prob_mort = xgb_mort.predict(F_te_final)
-    y_pred_los  = xgb_los.predict_days(F_te_final)
+    # IMPORTANT: use F_te_final (after interaction + cross + filter transforms),
+    # NOT the raw F_te from extract_features — the booster was trained on F_te_final's space.
+    y_prob_mort = xgb_mort.predict(F_te_mort)
+    y_pred_los  = xgb_los.predict_days(F_te_los)
 
     # ── 6. Offline benchmark ─────────────────────────────────────────────
+    # FIX 2 — enc_kw forwarded so eval_maboost() loads correct architecture
     bench = OfflineBenchmark(
         sequences        = seqs,
         mortality_labels = y_mort,
@@ -237,7 +406,7 @@ def main():
         mort_path        = str(Path(cfg["ckpt_dir"]) / "xgb_mortality.ubj"),
         los_path         = str(Path(cfg["ckpt_dir"]) / "xgb_los.ubj"),
         device           = s1["device"],
-        enc_kw           = enc_kw,
+        enc_kw           = enc_kw,   # FIX 2
     )
 
     skip_list = ["MaBoost (ours)"]
@@ -249,6 +418,7 @@ def main():
     if args.skip_new_tests:
         skip_list += ["early_prediction", "sparse_vs_dense", "rolling_prediction"]
 
+    # FIX 3 — baselines wrapped in try/except inside run_all()
     bench_results = bench.run_all(skip=skip_list)
 
     maboost_result = BenchResult(
@@ -286,6 +456,8 @@ def main():
         out_dir=cfg["results_dir"],
     )
 
+    # FIX 7: z_T block appears once, before run_shap (was duplicated)
+    # FIX 8: s1["device"] instead of cfg["device"] (no top-level "device" in cfg)
     enc_vis  = enc.to(s1["device"])
     z_T_list = []
     with torch.no_grad():
@@ -296,34 +468,24 @@ def main():
             z_T_list.append(enc_vis(x, tau, mask).cpu().numpy())
     z_T = np.vstack(z_T_list)
 
-    # FIX 10+11: load keep_idx_for_shap from mort_meta (xgb_mort.keep_idx is None).
-    # build_feature_names with keep_idx_for_shap aligns names to filtered features.
-    # Then pad with generic "inter_N" names for interaction columns prepended at front.
-    with open(Path(cfg["ckpt_dir"]) / "mort_meta.pkl", "rb") as _f:
-        _meta = pickle.load(_f)
-    keep_idx_for_shap = _meta.get("keep_idx_for_shap", None)
-
-    F_te_shap = F_te_final
+    F_te_shap_mort = F_te_mort
+    F_te_shap_los = F_te_los
 
     feat_names_shap = build_feature_names(
         ts_names = ts_names,
         st_names = st_names,
         d_model  = d_model,
-        keep_idx = keep_idx_for_shap,
+        keep_idx = xgb_mort.keep_idx,
     )
 
-    # FIX 11: pad interaction feature names if F_te_final has extra cols at front
-    n_shap_cols  = F_te_shap.shape[1]
-    n_named_cols = len(feat_names_shap)
-    if n_shap_cols > n_named_cols:
-        n_inter = n_shap_cols - n_named_cols
-        feat_names_shap = [f"inter_{i}" for i in range(n_inter)] + feat_names_shap
-
-    print(f"[SHAP] F_te_shap={F_te_shap.shape[1]}  feat_names={len(feat_names_shap)}")
+    print(
+        f"[SHAP] F_te_mort={F_te_shap_mort.shape[1]} "
+        f"F_te_los={F_te_shap_los.shape[1]} feat_names={len(feat_names_shap)}"
+    )
 
     run_shap(
         xgb_mort, xgb_los,
-        F_te_shap, F_te_final,
+        F_te_shap_mort, F_te_shap_los,
         feat_names_shap,
         y_prob_mort, ym_te.astype(int),
         z_T,

@@ -139,7 +139,7 @@ STATIC_NAMES: List[str] = [
 
 PAD_TAU      = 60.0    # seconds — padding tau value
 MIN_TAU      = 1.0     # minimum gap in seconds
-WINDOW_HOURS = 48.0    # prediction window: first 48h of ICU stay
+WINDOW_HOURS = 48.0    # default fixed-window mode (first 48h)
 MIMIC3_MAX_AGE = 91.4
 
 
@@ -204,12 +204,18 @@ def filter_by_age(
 # ---------------------------------------------------------------------------
 # Stage 3 — align lab events to 48h ICU window
 # ---------------------------------------------------------------------------
-def align_labs(labs: pl.DataFrame, icu: pl.DataFrame) -> pl.DataFrame:
+def align_labs(
+    labs: pl.DataFrame,
+    icu: pl.DataFrame,
+    window_mode: str = "fixed_48h",
+    window_hours: float = WINDOW_HOURS,
+) -> pl.DataFrame:
     """
-    Restrict LABEVENTS to [intime, intime + 48h] per stay.
+    Restrict LABEVENTS by window mode:
+      - fixed_48h: [intime, min(intime+window_hours, outtime)]
+      - expanding_window: [intime, outtime]
 
-    Change vs previous: upper bound is intime + 48h (not outtime) so
-    both chart and lab events cover exactly the same 48h prediction window.
+    In expanding_window mode, labs are kept across full ICU stay.
     """
     if labs is None or labs.is_empty() or icu is None or icu.is_empty():
         return pl.DataFrame()
@@ -243,18 +249,31 @@ def align_labs(labs: pl.DataFrame, icu: pl.DataFrame) -> pl.DataFrame:
             pl.Datetime, strict=False
         ).alias("_ct_dt")
 
-    out = (
+    df_l = (
         labs.with_columns([
             ct_expr,
             pl.col("hadm_id").cast(pl.Int64, strict=False),
         ])
         .join(win, on="hadm_id", how="inner")
-        .filter(
-            (pl.col("_ct_dt") >= pl.col("intime")) &
-            (pl.col("_ct_dt") <= pl.col("window_end"))
-        )
-        .drop(["intime", "outtime", "window_end", "hadm_id", "_ct_dt"])
     )
+    if window_mode == "expanding_window":
+        out = (
+            df_l
+            .filter(
+                (pl.col("_ct_dt") >= pl.col("intime")) &
+                (pl.col("_ct_dt") <= pl.col("outtime"))
+            )
+            .drop(["intime", "outtime", "window_end", "hadm_id", "_ct_dt"])
+        )
+    else:
+        out = (
+            df_l
+            .filter(
+                (pl.col("_ct_dt") >= pl.col("intime")) &
+                (pl.col("_ct_dt") <= pl.col("window_end"))
+            )
+            .drop(["intime", "outtime", "window_end", "hadm_id", "_ct_dt"])
+        )
     return out
 
 
@@ -262,7 +281,11 @@ def align_labs(labs: pl.DataFrame, icu: pl.DataFrame) -> pl.DataFrame:
 # Stage 4 — merge events (restricted to 48h window)
 # ---------------------------------------------------------------------------
 def merge_events(
-    chart: pl.DataFrame, labs: pl.DataFrame, icu: pl.DataFrame
+    chart: pl.DataFrame,
+    labs: pl.DataFrame,
+    icu: pl.DataFrame,
+    window_mode: str = "fixed_48h",
+    window_hours: float = WINDOW_HOURS,
 ) -> pl.DataFrame:
     if chart is None: chart = pl.DataFrame()
     if labs  is None: labs  = pl.DataFrame()
@@ -279,7 +302,7 @@ def merge_events(
             ])
             .with_columns(
                 pl.min_horizontal(
-                    pl.col("intime") + pl.duration(hours=int(WINDOW_HOURS)),
+                    pl.col("intime") + pl.duration(hours=int(window_hours)),
                     pl.col("outtime"),
                 ).alias("window_end")
             )
@@ -302,17 +325,28 @@ def merge_events(
             .filter(pl.col("valuenum").is_not_null())
             .join(valid, on="icustay_id", how="semi")
         )
-        # Filter chart to 48h window
+        # Filter chart by selected window
         if not win.is_empty():
-            c = (
-                c.join(win, on="icustay_id", how="left")
-                .filter(
-                    pl.col("charttime").is_not_null() &
-                    (pl.col("charttime") >= pl.col("intime")) &
-                    (pl.col("charttime") <= pl.col("window_end"))
+            if window_mode == "expanding_window":
+                c = (
+                    c.join(win, on="icustay_id", how="left")
+                    .filter(
+                        pl.col("charttime").is_not_null() &
+                        (pl.col("charttime") >= pl.col("intime")) &
+                        (pl.col("charttime") <= pl.col("outtime"))
+                    )
+                    .drop(["intime", "outtime", "window_end"])
                 )
-                .drop(["intime", "outtime", "window_end"])
-            )
+            else:
+                c = (
+                    c.join(win, on="icustay_id", how="left")
+                    .filter(
+                        pl.col("charttime").is_not_null() &
+                        (pl.col("charttime") >= pl.col("intime")) &
+                        (pl.col("charttime") <= pl.col("window_end"))
+                    )
+                    .drop(["intime", "outtime", "window_end"])
+                )
         c = c.with_columns(
             pl.when(pl.col("itemid").is_in(list(_FAHRENHEIT)))
             .then((pl.col("valuenum") - 32.0) * 5.0 / 9.0)
@@ -596,6 +630,8 @@ def run_etl(
     mimic_dir: str,
     seq_len:   int  = 128,    # raised from 48 to 128 for timestamp-level seqs
     min_age:   int  = 18,
+    window_mode: str = "fixed_48h",
+    window_hours: float = WINDOW_HOURS,
     save_dir:  Optional[str] = None,
 ) -> Dict:
     """Execute all 8 stages and return the ETL output dict."""
@@ -615,13 +651,13 @@ def run_etl(
     print("[ETL] Running pipeline …")
     pat   = infer_age(pat, adm)
     icu   = filter_by_age(icu, pat, min_age)
-    labs  = align_labs(labs, icu)
+    labs  = align_labs(labs, icu, window_mode=window_mode, window_hours=window_hours)
 
     if chart is None: chart = pl.DataFrame()
     if labs  is None: labs  = pl.DataFrame()
     if icu   is None: icu   = pl.DataFrame()
 
-    events        = merge_events(chart, labs, icu)
+    events        = merge_events(chart, labs, icu, window_mode=window_mode, window_hours=window_hours)
     events        = compute_delta_t(events)
     seqs          = build_sequences(events, seq_len)
     static        = build_static_features(icu, pat, adm, diag)
@@ -639,14 +675,18 @@ def run_etl(
         feature_names    = FEATURE_NAMES,
         static_names     = STATIC_NAMES,
         seq_len          = seq_len,
-        window_hours     = WINDOW_HOURS,
+        window_hours     = window_hours,
+        window_mode      = window_mode,
     )
     if save_dir:
         sp = Path(save_dir)
         sp.mkdir(parents=True, exist_ok=True)
+        suffix = "expanding" if window_mode == "expanding_window" else "fixed48"
+        with (sp / f"etl_output_{suffix}.pkl").open("wb") as f:
+            pickle.dump(out, f, protocol=5)
         with (sp / "etl_output.pkl").open("wb") as f:
             pickle.dump(out, f, protocol=5)
-        print(f"[ETL] Saved → {sp}/etl_output.pkl")
+        print(f"[ETL] Saved → {sp}/etl_output_{suffix}.pkl")
     return out
 
 
