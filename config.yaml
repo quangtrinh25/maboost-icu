@@ -1,0 +1,108 @@
+# MaBoost configuration — v7 optimised for MIMIC-IV 65+ (47k patients)
+#
+# Encoder: d_model=256, n_layers=4, d_state=32 (same as v6-larger)
+# Stage 1: lr=5e-4, 150 epochs, patience=30 — stable with large encoder
+# Stage 2: all v5 optimisations enabled
+#   OPT-1: isotonic calibration (replaces Platt)
+#   OPT-2: cover-based feature filter (replaces gain)
+#   OPT-3: LOS pseudohubererror (in xgboost_head.py)
+#   OPT-4: interaction features (top-8 × top-8 = 28 pairs)
+#   OPT-5: mortality ensemble (2 seeds)
+#   OPT-6: static × z_multi cross features
+#   OPT-7: encoder fine-tune disabled (set finetune_enc_epochs > 0 to enable)
+
+data:
+  mimic_dir:    /home/milis/maboost/data/raw/mimiciv
+  processed:    /home/milis/maboost/data/processed
+  splits:       /home/milis/maboost/data/splits
+  seq_len:      64
+  sequence_crop: first
+  window_hours: 48
+  window_mode:  fixed_48h
+  min_age:      65
+  train_frac:   0.60
+  val_frac:     0.20
+
+model:
+  d_model:  256
+  d_state:  32
+  n_layers: 4
+  n_heads:  4
+  topk:     5
+  dropout:  0.1
+  ref_points: 32
+
+stage1:
+  epochs:        120
+  lr:            0.0005
+  batch_size:    16
+  patience:      15
+  clip_norm:     1.0
+  device:        cuda
+  warmup_frac:   0.10
+  ema_decay:     0.999
+  focal_gamma:   2.0
+  loss_weight:   0.5
+  use_mixup:     true
+  use_mixup_expanding: false
+  mixup_alpha:   0.4
+  aux_weight:    0.05
+  aux_held_rate: 0.20
+  remaining_los_weight: 0.30
+  trend_stop_window: 8
+  trend_stop_delta: 0.01
+
+stage2:
+  n_estimators:      500
+  max_depth:         5
+  learning_rate:     0.05
+  subsample:         0.80
+  colsample_bytree:  0.80
+  min_child_weight:  5
+  reg_lambda:        1.0
+  early_stopping:    30
+  device:            cuda
+
+  use_optuna:         true
+  n_optuna_trials:    10
+  optuna_depth_max:   5
+  optuna_n_max:       500
+  use_dart:           false
+
+  use_calibration:    true
+  use_isotonic:       true
+  drop_low_importance: true
+
+  use_interaction_features: true
+  n_interaction_top: 6
+
+  n_ensemble_mort: 1
+  use_static_cross: true
+
+  finetune_enc_epochs: 0
+  finetune_enc_lr:     1e-5
+
+results_dir:  /home/milis/maboost/results
+ckpt_dir:     /home/milis/maboost/checkpoints
+seed:         42
+
+online:
+  event_file: /home/milis/maboost/results/online_events.jsonl
+  history_len: 64
+  thresh_mild: 0.05
+  thresh_severe: 0.10
+  update_flush_every: 32
+  d_input: 40
+
+research:
+  use_longitudinal_samples: true
+  use_horizon_labels: true
+  use_observation_window: true
+  obs_window_hours: 4.0
+  mortality_horizon_hours: 24.0
+  los_target: remaining
+  enable_remaining_head: true
+  group_aware_split: true
+  min_elapsed_hours: 4.0
+  step_hours: 4.0
+  max_samples_per_stay: 8

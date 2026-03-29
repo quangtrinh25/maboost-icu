@@ -299,11 +299,12 @@ class MambaEncoder(nn.Module):
 
 class DualHeadMamba(nn.Module):
     def __init__(self, d_input: int, d_model: int = 128,
-                 d_static: int = 0, **enc_kw):
+                 d_static: int = 0, enable_remaining_head: bool = False, **enc_kw):
         super().__init__()
         self.encoder    = MambaEncoder(d_input, d_model, **enc_kw)
         drop            = enc_kw.get("dropout", 0.1)
         self.has_static = d_static > 0
+        self.enable_remaining_head = bool(enable_remaining_head)
         if self.has_static:
             self.static_emb = nn.Sequential(
                 nn.Linear(d_static, d_model), nn.ReLU(),
@@ -317,6 +318,11 @@ class DualHeadMamba(nn.Module):
             nn.Linear(d_model, d_model // 2), nn.GELU(),
             nn.Dropout(drop), nn.Linear(d_model // 2, 1),
         )
+        if self.enable_remaining_head:
+            self.rem_los_head = nn.Sequential(
+                nn.Linear(d_model, d_model // 2), nn.GELU(),
+                nn.Dropout(drop), nn.Linear(d_model // 2, 1),
+            )
 
     def forward(self, x: torch.Tensor, tau: torch.Tensor,
                 mask: Optional[torch.Tensor] = None,
@@ -327,3 +333,16 @@ class DualHeadMamba(nn.Module):
         if self.has_static and x_static is not None:
             z = z + self.static_emb(torch.nan_to_num(x_static, nan=0.0))
         return self.mort_head(z), self.los_head(z).squeeze(-1)
+
+    def forward_research(self, x: torch.Tensor, tau: torch.Tensor,
+                         mask: Optional[torch.Tensor] = None,
+                         x_static: Optional[torch.Tensor] = None,
+                         t_abs: Optional[torch.Tensor] = None,
+                         ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        z = self.encoder(x, tau, mask, t_abs)
+        if self.has_static and x_static is not None:
+            z = z + self.static_emb(torch.nan_to_num(x_static, nan=0.0))
+        mort = self.mort_head(z)
+        los_total = self.los_head(z).squeeze(-1)
+        los_rem = self.rem_los_head(z).squeeze(-1) if self.enable_remaining_head else None
+        return mort, los_total, los_rem

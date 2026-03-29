@@ -149,7 +149,7 @@ def extract_features(
 
     for batch in loader:
         x, tau, mask = batch[0].to(device), batch[1].to(device), batch[2].to(device)
-        has_static   = len(batch) == 6
+        has_static   = len(batch) >= 6 and hasattr(batch[3], "dim") and batch[3].dim() > 1
 
         z_multi, raw_stats = enc.extract_features(x, tau, mask)
         z_multi   = z_multi.cpu().numpy()

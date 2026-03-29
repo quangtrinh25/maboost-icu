@@ -210,6 +210,9 @@ def train_stage1(
     mixup_alpha:  float = 0.4,
     aux_weight:   float = 0.1,
     aux_held_rate: float = 0.2,
+    remaining_los_weight: float = 0.3,
+    trend_stop_window: int = 8,
+    trend_stop_delta: float = 0.01,
 ) -> DualHeadMamba:
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
     ckpt  = Path(ckpt_dir) / "encoder_best.pth"
@@ -266,34 +269,66 @@ def train_stage1(
     ema      = ModelEMA(model, decay=ema_decay)
     best_auc = 0.0
     no_imp   = 0
+    auc_hist = []
     print(f"[Stage 1] Training — up to {epochs} epochs  patience={patience}")
 
     for ep in range(1, epochs + 1):
         model.train()
         ep_loss = ep_lm = ep_ll = ep_aux = ep_grad = 0.0
+        ep_lr = 0.0
         n_ok = n_skip = 0
 
         for batch in train_loader:
             x, tau, mask = (batch[i].to(device) for i in range(3))
-            has_static   = len(batch) == 6
-            x_static     = batch[3].to(device) if has_static else None
-            y_mort       = batch[-2].to(device)
-            y_los        = batch[-1].to(device)
+            has_static = len(batch) in (6, 7)
+            has_rem = len(batch) in (6, 7) and model.enable_remaining_head
+            if len(batch) == 7:
+                x_static = batch[3].to(device)
+                y_los_rem = batch[4].to(device)
+                y_mort = batch[5].to(device)
+                y_los = batch[6].to(device)
+            elif len(batch) == 6 and has_static:
+                x_static = batch[3].to(device)
+                y_los_rem = None
+                y_mort = batch[4].to(device)
+                y_los = batch[5].to(device)
+            elif len(batch) == 6:
+                x_static = None
+                y_los_rem = batch[3].to(device)
+                y_mort = batch[4].to(device)
+                y_los = batch[5].to(device)
+            else:
+                x_static = None
+                y_los_rem = None
+                y_mort = batch[-2].to(device)
+                y_los = batch[-1].to(device)
 
             if use_mixup:
                 x, tau, mask, y_mort, y_los, x_static = mixup_batch(
                     x, tau, mask, y_mort, y_los,
                     x_static=x_static, alpha=mixup_alpha,
                 )
+                y_los_rem = None
 
             opt.zero_grad(set_to_none=True)
 
-            logits, pred_los = model(x, tau, mask, x_static=x_static)
+            if model.enable_remaining_head:
+                logits, pred_los, pred_los_rem = model.forward_research(
+                    x, tau, mask, x_static=x_static
+                )
+            else:
+                logits, pred_los = model(x, tau, mask, x_static=x_static)
+                pred_los_rem = None
             logits   = logits.clamp(-20.0, 20.0)
             pred_los = pred_los.clamp(-8.0, 8.0)
             loss_m   = focal(logits, y_mort)
             loss_l   = log_cosh_loss(pred_los, torch.log1p(y_los))
             loss     = loss_m + loss_weight * loss_l
+            if pred_los_rem is not None and y_los_rem is not None:
+                pred_los_rem = pred_los_rem.clamp(-8.0, 8.0)
+                loss_lr = log_cosh_loss(pred_los_rem, torch.log1p(y_los_rem))
+                loss = loss + remaining_los_weight * loss_lr
+                ep_lr += loss_lr.item()
 
             if use_aux:
                 try:
@@ -337,14 +372,16 @@ def train_stage1(
         saved_state = copy.deepcopy(model.state_dict())
         ema.apply(model)
         auc = _eval(model, val_loader, device)
+        auc_hist.append(float(auc))
         model.load_state_dict(saved_state)
 
         nb = max(n_ok, 1)
         aux_str = f" aux={ep_aux/nb:.4f}" if use_aux else ""
+        lr_str = f" rem={ep_lr/nb:.4f}" if model.enable_remaining_head else ""
         print(
             f"  ep {ep:3d}/{epochs} | "
             f"loss={ep_loss/nb:.4f} "
-            f"(m={ep_lm/nb:.4f} l={ep_ll/nb:.4f}{aux_str}) | "
+            f"(m={ep_lm/nb:.4f} l={ep_ll/nb:.4f}{lr_str}{aux_str}) | "
             f"grad={ep_grad/nb:.3f} | AUC={auc:.4f}"
             + (f" [{n_skip} skip]" if n_skip else "")
         )
@@ -357,6 +394,18 @@ def train_stage1(
             print(f"    ✓ AUC {best_auc:.4f} — saved")
         else:
             no_imp += 1
+            if trend_stop_window > 1 and len(auc_hist) >= trend_stop_window:
+                recent = auc_hist[-trend_stop_window:]
+                head = recent[: trend_stop_window // 2]
+                tail = recent[trend_stop_window // 2 :]
+                if len(head) > 0 and len(tail) > 0:
+                    if (float(np.mean(head)) - float(np.mean(tail))) >= trend_stop_delta:
+                        print(
+                            f"  Trend-stop at epoch {ep}: recent AUC drop "
+                            f"{float(np.mean(head)) - float(np.mean(tail)):.4f} "
+                            f"(window={trend_stop_window})"
+                        )
+                        break
             if no_imp >= patience:
                 print(f"  Early stop at epoch {ep}")
                 break

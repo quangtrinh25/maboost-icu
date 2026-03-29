@@ -53,6 +53,7 @@ class XGBMortality:
         self.platt     = None    # kept for load() backward compat, not used in new fits
         self.calibrator = None   # IsotonicRegression calibrator (replaces platt)
         self.keep_idx  = None    # feature importance filter indices
+        self.ensemble_boosters: list[xgb.Booster] = []
 
     def fit(self, F_tr, y_tr, F_va, y_va,
             n_rounds: int = 500, early: int = 30):
@@ -111,7 +112,9 @@ class XGBMortality:
         falls back to Platt for models loaded from old checkpoints.
         """
         F_sel = self._select(F)
-        raw   = self.booster.predict(_dmatrix(F_sel))
+        dm = _dmatrix(F_sel)
+        boosters = self.ensemble_boosters if self.ensemble_boosters else [self.booster]
+        raw = np.mean([bst.predict(dm) for bst in boosters], axis=0)
         if self.calibrator is not None:
             raw = self.calibrator.predict(raw)
         elif self.platt is not None:
@@ -128,12 +131,21 @@ class XGBMortality:
         m = cls()
         m.booster = xgb.Booster()
         m.booster.load_model(path)
+        m.ensemble_boosters = [m.booster]
         if meta_path and Path(meta_path).exists():
             with open(meta_path, "rb") as f:
                 meta = pickle.load(f)
             m.calibrator = meta.get("calibrator")
             m.platt      = meta.get("platt")      # backward compat
             m.keep_idx   = meta.get("keep_idx")
+        base = Path(path)
+        extra_boosters = []
+        for extra_path in sorted(base.parent.glob(f"{base.stem}_ens*.{base.suffix.lstrip('.')}")):
+            bst = xgb.Booster()
+            bst.load_model(str(extra_path))
+            extra_boosters.append(bst)
+        if extra_boosters:
+            m.ensemble_boosters.extend(extra_boosters)
         return m
 
 

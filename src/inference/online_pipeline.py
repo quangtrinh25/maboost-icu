@@ -216,6 +216,7 @@ class MaBoostOnlinePipeline:
             self.xgb_mort.booster = xgb.train(
                 mort_params, dm_m, num_boost_round=10,
                 xgb_model=self.xgb_mort.booster, verbose_eval=False)
+            self.xgb_mort.ensemble_boosters = [self.xgb_mort.booster]
             # FIX 2: update LOS model too
             self.xgb_los.booster = xgb.train(
                 los_params, dm_l, num_boost_round=10,
@@ -230,6 +231,7 @@ class MaBoostOnlinePipeline:
                  "refresh_leaf": True, "reg_lambda": 1.0},
                 dm_m, num_boost_round=1,
                 xgb_model=self.xgb_mort.booster, verbose_eval=False)
+            self.xgb_mort.ensemble_boosters = [self.xgb_mort.booster]
             # FIX 2: update LOS model too
             self.xgb_los.booster = xgb.train(
                 {"process_type": "update", "updater": "refresh",

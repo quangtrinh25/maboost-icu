@@ -263,7 +263,7 @@ def align_labs(
                 (pl.col("_ct_dt") >= pl.col("intime")) &
                 (pl.col("_ct_dt") <= pl.col("outtime"))
             )
-            .drop(["intime", "outtime", "window_end", "hadm_id", "_ct_dt"])
+            .drop(["outtime", "window_end", "hadm_id", "_ct_dt"])
         )
     else:
         out = (
@@ -272,7 +272,7 @@ def align_labs(
                 (pl.col("_ct_dt") >= pl.col("intime")) &
                 (pl.col("_ct_dt") <= pl.col("window_end"))
             )
-            .drop(["intime", "outtime", "window_end", "hadm_id", "_ct_dt"])
+            .drop(["outtime", "window_end", "hadm_id", "_ct_dt"])
         )
     return out
 
@@ -335,7 +335,7 @@ def merge_events(
                         (pl.col("charttime") >= pl.col("intime")) &
                         (pl.col("charttime") <= pl.col("outtime"))
                     )
-                    .drop(["intime", "outtime", "window_end"])
+                    .drop(["outtime", "window_end"])
                 )
             else:
                 c = (
@@ -345,7 +345,7 @@ def merge_events(
                         (pl.col("charttime") >= pl.col("intime")) &
                         (pl.col("charttime") <= pl.col("window_end"))
                     )
-                    .drop(["intime", "outtime", "window_end"])
+                    .drop(["outtime", "window_end"])
                 )
         c = c.with_columns(
             pl.when(pl.col("itemid").is_in(list(_FAHRENHEIT)))
@@ -425,7 +425,11 @@ def compute_delta_t(df: pl.DataFrame) -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 # Stage 6 — build_sequences (MAJOR REWRITE)
 # ---------------------------------------------------------------------------
-def build_sequences(df: pl.DataFrame, seq_len: int = 128) -> Dict:
+def build_sequences(
+    df: pl.DataFrame,
+    seq_len: int = 128,
+    crop_strategy: str = "last",
+) -> Dict:
     """
     Pivot long events → per-stay (seq_len, N_FEAT) timestamp-level arrays.
 
@@ -442,7 +446,7 @@ def build_sequences(df: pl.DataFrame, seq_len: int = 128) -> Dict:
     Sequence construction:
     1. Truncate to WINDOW_HOURS (48h) from first observation
     2. Group by minute → unique timestamps
-    3. Take last seq_len timestamps (most recent context)
+    3. Keep either the first or last seq_len timestamps
     4. Pad shorter stays with NaN rows at the front
     """
     fidx = {f: i for i, f in enumerate(FEATURE_NAMES)}
@@ -496,22 +500,38 @@ def build_sequences(df: pl.DataFrame, seq_len: int = 128) -> Dict:
                     seq_full[t_idx, j]  = float(v)
                     mask_full[t_idx, j] = 1.0
 
-        # --- Compute tau_t between consecutive minutes ---
+        # --- Compute tau_t and absolute elapsed time since ICU admission ---
         # Use epoch seconds of each unique minute
         epochs  = np.array([
             int(m.timestamp()) if hasattr(m, "timestamp")
             else int(m.seconds_since_epoch())
             for m in minute_list
         ], dtype=np.float64)
+        intime_val = grp["intime"][0] if "intime" in grp.columns and grp.height > 0 else None
+        if intime_val is not None:
+            intime_epoch = (
+                int(intime_val.timestamp()) if hasattr(intime_val, "timestamp")
+                else int(intime_val.seconds_since_epoch())
+            )
+        else:
+            intime_epoch = int(epochs[0]) if len(epochs) > 0 else 0
+        elapsed_full = np.maximum(epochs - intime_epoch, 0.0).astype(np.float32)
         tau_full         = np.empty(T_full, dtype=np.float32)
         tau_full[0]      = PAD_TAU
         tau_full[1:]     = np.diff(epochs).clip(min=MIN_TAU).astype(np.float32)
 
-        # --- Take last seq_len timestamps ---
+        # --- Keep first/last seq_len timestamps ---
         if T_full >= seq_len:
-            seq  = seq_full[-seq_len:]
-            tau  = tau_full[-seq_len:]
-            mask = mask_full[-seq_len:]
+            if crop_strategy == "first":
+                seq  = seq_full[:seq_len]
+                tau  = tau_full[:seq_len]
+                mask = mask_full[:seq_len]
+                elapsed = elapsed_full[:seq_len]
+            else:
+                seq  = seq_full[-seq_len:]
+                tau  = tau_full[-seq_len:]
+                mask = mask_full[-seq_len:]
+                elapsed = elapsed_full[-seq_len:]
         else:
             # Pad at the front with NaN rows, PAD_TAU, zero mask
             pad  = seq_len - T_full
@@ -527,8 +547,12 @@ def build_sequences(df: pl.DataFrame, seq_len: int = 128) -> Dict:
                 np.zeros((pad, N_FEAT), dtype=np.float32),
                 mask_full,
             ])
+            elapsed = np.concatenate([
+                np.zeros(pad, dtype=np.float32),
+                elapsed_full,
+            ])
 
-        out[sid] = (seq, tau, mask)
+        out[sid] = (seq, tau, mask, elapsed)
         n_stays_ok += 1
         obs_counts.append(int(mask.sum()))
 
@@ -602,17 +626,62 @@ def build_static_features(icu, patients, admissions, diagnoses) -> Dict:
 # ---------------------------------------------------------------------------
 # Stage 8 — labels (unchanged)
 # ---------------------------------------------------------------------------
-def build_labels(icu, admissions) -> Tuple[Dict, Dict]:
+def _parse_dt_like(v):
+    if v is None:
+        return None
+    if hasattr(v, "timestamp") or hasattr(v, "seconds_since_epoch"):
+        return v
+    try:
+        return pl.Series([v]).str.to_datetime(
+            format="%Y-%m-%d %H:%M:%S", strict=False
+        )[0]
+    except Exception:
+        return None
+
+
+def build_labels(icu, admissions, patients=None) -> Tuple[Dict, Dict, Dict]:
     expire: Dict[int, int] = {}
+    adm_time: Dict[int, Dict] = {}
     if not admissions.is_empty() and "hospital_expire_flag" in admissions.columns:
         for r in admissions.iter_rows(named=True):
-            expire[int(r["hadm_id"])] = int(r.get("hospital_expire_flag") or 0)
+            hid = int(r["hadm_id"])
+            expire[hid] = int(r.get("hospital_expire_flag") or 0)
+            adm_time[hid] = {
+                "dischtime": _parse_dt_like(r.get("dischtime")),
+                "deathtime": _parse_dt_like(r.get("deathtime")),
+            }
+    patient_dod: Dict[int, object] = {}
+    if patients is not None and not patients.is_empty() and "dod" in patients.columns:
+        for r in patients.iter_rows(named=True):
+            patient_dod[int(r["subject_id"])] = _parse_dt_like(r.get("dod"))
     mort, los = {}, {}
+    stay_outcomes = {}
     has_los   = "los" in icu.columns
     for r in icu.iter_rows(named=True):
         icid       = int(r["icustay_id"])
-        mort[icid] = expire.get(int(r["hadm_id"]), 0)
-        los[icid]  = float(r["los"]) if has_los and r["los"] is not None else 0.0
+        hid        = int(r["hadm_id"])
+        sid        = int(r["subject_id"])
+        mort[icid] = expire.get(hid, 0)
+        los_days   = float(r["los"]) if has_los and r["los"] is not None else 0.0
+        los[icid]  = los_days
+        intime_dt  = _parse_dt_like(r.get("intime"))
+        outtime_dt = _parse_dt_like(r.get("outtime"))
+        deathtime_dt = adm_time.get(hid, {}).get("deathtime") or patient_dod.get(sid)
+        death_offset_days = None
+        if intime_dt is not None and deathtime_dt is not None:
+            try:
+                death_offset_days = max(
+                    float((deathtime_dt - intime_dt).total_seconds() / 86400.0),
+                    0.0,
+                )
+            except Exception:
+                death_offset_days = None
+        stay_outcomes[icid] = {
+            "icu_los_days": los_days,
+            "death_offset_days": death_offset_days,
+            "has_death_time": bool(deathtime_dt is not None),
+            "has_outtime": bool(outtime_dt is not None),
+        }
     n_pos = sum(mort.values())
     n     = len(mort)
     print(
@@ -620,7 +689,7 @@ def build_labels(icu, admissions) -> Tuple[Dict, Dict]:
         f"mortality {n_pos:,} ({100*n_pos/max(n,1):.1f}%) | "
         f"mean LOS {np.mean(list(los.values())):.1f}d"
     )
-    return mort, los
+    return mort, los, stay_outcomes
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +701,7 @@ def run_etl(
     min_age:   int  = 18,
     window_mode: str = "fixed_48h",
     window_hours: float = WINDOW_HOURS,
+    crop_strategy: str = "last",
     save_dir:  Optional[str] = None,
 ) -> Dict:
     """Execute all 8 stages and return the ETL output dict."""
@@ -659,9 +729,9 @@ def run_etl(
 
     events        = merge_events(chart, labs, icu, window_mode=window_mode, window_hours=window_hours)
     events        = compute_delta_t(events)
-    seqs          = build_sequences(events, seq_len)
+    seqs          = build_sequences(events, seq_len, crop_strategy=crop_strategy)
     static        = build_static_features(icu, pat, adm, diag)
-    y_mort, y_los = build_labels(icu, adm)
+    y_mort, y_los, stay_outcomes = build_labels(icu, adm, pat)
 
     n = len(set(seqs) & set(y_mort))
     print(f"[ETL] Complete — {n:,} labelled stays ready.")
@@ -674,9 +744,11 @@ def run_etl(
         los_labels       = y_los,
         feature_names    = FEATURE_NAMES,
         static_names     = STATIC_NAMES,
+        stay_outcomes    = stay_outcomes,
         seq_len          = seq_len,
         window_hours     = window_hours,
         window_mode      = window_mode,
+        crop_strategy    = crop_strategy,
     )
     if save_dir:
         sp = Path(save_dir)

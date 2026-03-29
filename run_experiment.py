@@ -37,10 +37,12 @@ import numpy as np
 import torch
 import yaml
 from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import roc_auc_score, average_precision_score, mean_absolute_error
 
 from src.data.preprocess      import run_etl, load_etl_output
 from src.data.dataset         import make_loaders
+from src.data.temporal_samples import build_event_driven_samples
 from src.models.mamba_encoder import DualHeadMamba, MambaEncoder
 from src.models.xgboost_head  import XGBMortality, XGBLos
 from src.training.stage1_train import train_stage1
@@ -48,6 +50,7 @@ from src.training.stage2_train import (
     load_frozen_encoder, extract_features, train_stage2, apply_stage2_transforms
 )
 from src.inference.offline_pipeline import OfflineBenchmark, BenchResult
+from src.inference.offline_pipeline import _flat as _flat_features
 from src.inference.online_pipeline import MaBoostOnlinePipeline
 from src.visualization.training_plots import save_all
 from src.visualization.shap_explain   import run_shap, build_feature_names
@@ -56,6 +59,55 @@ from src.visualization.shap_explain   import run_shap, build_feature_names
 def load_cfg(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def _train_eval_xgb_heads(
+    X_tr, ym_tr, yl_tr, X_va, ym_va, yl_va, X_te, ym_te, yl_te, device: str = "cuda"
+):
+    m = XGBMortality(device=device)
+    l = XGBLos(device=device)
+    m.fit(X_tr, ym_tr, X_va, ym_va)
+    l.fit(X_tr, yl_tr, X_va, yl_va)
+    yp_m = m.predict(X_te)
+    yp_l = l.predict_days(X_te)
+    return {
+        "auroc": float(roc_auc_score(ym_te, yp_m)),
+        "auprc": float(average_precision_score(ym_te, yp_m)),
+        "los_mae": float(mean_absolute_error(yl_te, yp_l)),
+        "los_rmse": float(np.sqrt(((yl_te - yp_l) ** 2).mean())),
+    }
+
+
+def _save_head_ablation(rows, out_csv: str):
+    import csv
+    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["head", "auroc", "auprc", "los_mae", "los_rmse"])
+        w.writeheader()
+        for r in rows:
+            w.writerow({
+                "head": r["head"],
+                "auroc": f"{r['auroc']:.6f}",
+                "auprc": f"{r['auprc']:.6f}",
+                "los_mae": f"{r['los_mae']:.4f}",
+                "los_rmse": f"{r['los_rmse']:.4f}",
+            })
+    print(f"[Ablation] Head comparison saved → {out_csv}")
+
+
+def _print_head_ablation(rows):
+    print("\n" + "=" * 70)
+    print("  HEAD ABLATION — Frozen Mamba + XGBoost family")
+    print("=" * 70)
+    h = f"{'Head':<16}  {'AUROC':>6}  {'AUPRC':>6}  {'MAE(d)':>7}  {'RMSE(d)':>8}"
+    print(h)
+    print("─" * len(h))
+    for r in sorted(rows, key=lambda x: x["auroc"], reverse=True):
+        print(
+            f"{r['head']:<16}  {r['auroc']:>6.4f}  {r['auprc']:>6.4f}  "
+            f"{r['los_mae']:>7.3f}  {r['los_rmse']:>8.3f}"
+        )
+    print("─" * len(h))
 
 
 def _online_loop(cfg: dict, event_file: str, poll_seconds: float = 0.25) -> None:
@@ -223,6 +275,10 @@ def main():
     else:
         window_mode = cfg.get("data", {}).get("window_mode", "fixed_48h")
     window_hours = float(cfg["data"].get("window_hours", 48.0))
+    crop_strategy = cfg.get("data", {}).get(
+        "sequence_crop",
+        "first" if window_mode == "fixed_48h" else "last",
+    )
     suffix = "expanding" if window_mode == "expanding_window" else "fixed48"
 
     Path(cfg["results_dir"]).mkdir(parents=True, exist_ok=True)
@@ -239,14 +295,56 @@ def main():
             min_age   = cfg["data"]["min_age"],
             window_mode = window_mode,
             window_hours = window_hours,
+            crop_strategy = crop_strategy,
             save_dir  = cfg["data"]["processed"],
         )
 
     seqs, static  = etl["sequences"], etl["static_features"]
     y_mort, y_los = etl["mortality_labels"], etl["los_labels"]
+    stay_outcomes = etl.get("stay_outcomes", {})
+    y_los_rem = None
     ts_names      = etl["feature_names"]   # 40 time-series feature names
     st_names      = etl["static_names"]    # 42 static feature names
     d_input       = len(ts_names)
+    # Optional research-grade longitudinal expansion for expanding-window mode.
+    research_cfg = cfg.get("research", {})
+    sample_to_stay = None
+    if research_cfg.get("use_longitudinal_samples", True):
+        temporal = build_event_driven_samples(
+            sequences=seqs,
+            mortality_labels=y_mort,
+            los_labels=y_los,
+            stay_outcomes=stay_outcomes,
+            static_features=static,
+            min_elapsed_hours=float(research_cfg.get("min_elapsed_hours", 6.0)),
+            step_hours=float(research_cfg.get("step_hours", 6.0)),
+            max_samples_per_stay=int(research_cfg.get("max_samples_per_stay", 64)),
+            obs_window_hours=(
+                float(research_cfg["obs_window_hours"])
+                if research_cfg.get("use_observation_window", False)
+                else None
+            ),
+            mortality_horizon_hours=(
+                float(research_cfg["mortality_horizon_hours"])
+                if research_cfg.get("use_horizon_labels", True)
+                else None
+            ),
+            los_target=str(research_cfg.get("los_target", "remaining")),
+        )
+        seqs = temporal["sequences"]
+        static = temporal["static_features"] if temporal["static_features"] is not None else static
+        y_mort = temporal["mortality_labels"]
+        y_los = temporal["los_labels"]
+        y_los_rem = temporal["los_remaining_labels"]
+        sample_to_stay = temporal["sample_to_stay"]
+        print(
+            f"[Research] Longitudinal samples: {len(seqs):,} "
+            f"from {len(set(sample_to_stay.values())):,} stays | "
+            f"obs_window={research_cfg.get('obs_window_hours', 'prefix')}h | "
+            f"mort_h={research_cfg.get('mortality_horizon_hours', 'final')}h | "
+            f"los={research_cfg.get('los_target', 'remaining')}"
+        )
+
     # FIX 5: cfg is a dict — use cfg["model"]["d_model"], not cfg.model.d_model
     d_model       = cfg["model"]["d_model"]
 
@@ -273,19 +371,32 @@ def main():
     labels  = [y_mort[s] for s in all_ids]
     tr_f    = cfg["data"]["train_frac"]
     va_f    = cfg["data"]["val_frac"]
-
-    tr_ids, tmp, _, tmp_l = train_test_split(
-        all_ids, labels,
-        test_size=1 - tr_f,
-        stratify=labels,
-        random_state=cfg["seed"],
-    )
-    te_frac = (1 - tr_f - va_f) / (1 - tr_f)
-    va_ids, te_ids = train_test_split(
-        tmp, test_size=te_frac,
-        stratify=tmp_l,
-        random_state=cfg["seed"],
-    )
+    if sample_to_stay is not None and research_cfg.get("group_aware_split", True):
+        groups = np.array([sample_to_stay[s] for s in all_ids])
+        gss1 = GroupShuffleSplit(n_splits=1, train_size=tr_f, random_state=cfg["seed"])
+        tr_idx, tmp_idx = next(gss1.split(all_ids, labels, groups=groups))
+        tr_ids = [all_ids[i] for i in tr_idx]
+        tmp_ids = [all_ids[i] for i in tmp_idx]
+        tmp_groups = np.array([sample_to_stay[s] for s in tmp_ids])
+        te_frac = (1 - tr_f - va_f) / (1 - tr_f)
+        gss2 = GroupShuffleSplit(n_splits=1, test_size=te_frac, random_state=cfg["seed"])
+        va_i, te_i = next(gss2.split(tmp_ids, [y_mort[s] for s in tmp_ids], groups=tmp_groups))
+        va_ids = [tmp_ids[i] for i in va_i]
+        te_ids = [tmp_ids[i] for i in te_i]
+        print("[Research] Group-aware split enabled (no patient leakage across splits).")
+    else:
+        tr_ids, tmp, _, tmp_l = train_test_split(
+            all_ids, labels,
+            test_size=1 - tr_f,
+            stratify=labels,
+            random_state=cfg["seed"],
+        )
+        te_frac = (1 - tr_f - va_f) / (1 - tr_f)
+        va_ids, te_ids = train_test_split(
+            tmp, test_size=te_frac,
+            stratify=tmp_l,
+            random_state=cfg["seed"],
+        )
 
     # Save split IDs
     splits_dir = Path(cfg["data"]["splits"])
@@ -298,6 +409,7 @@ def main():
     tr_loader, va_loader, te_loader = make_loaders(
         seqs, y_mort, y_los, tr_ids, va_ids, te_ids,
         static_features=static,
+        los_remaining_labels=y_los_rem,
         batch_size=s1["batch_size"],
     )
 
@@ -316,8 +428,17 @@ def main():
     d_static = next(iter(static.values())).shape[0] if static else 0
     model    = DualHeadMamba(
         d_input=d_input, d_model=d_model,
-        d_static=d_static, **enc_kw,
+        d_static=d_static,
+        enable_remaining_head=bool(y_los_rem is not None and research_cfg.get("enable_remaining_head", True)),
+        **enc_kw,
     )
+    use_mixup = bool(s1.get("use_mixup", True))
+    if y_los_rem is not None:
+        # In longitudinal / early-sample mode, mixup blurs temporal supervision
+        # and disables the remaining-LOS loss path in the current trainer.
+        # Disable it whenever per-cutpoint remaining-LOS labels are present,
+        # regardless of fixed_48h vs expanding_window ETL mode.
+        use_mixup = bool(s1.get("use_mixup_expanding", False))
     model = train_stage1(
         model, tr_loader, va_loader,
         epochs     = s1["epochs"],
@@ -326,8 +447,17 @@ def main():
         clip_norm  = s1["clip_norm"],
         ckpt_dir   = cfg["ckpt_dir"],
         device     = s1["device"],
+        warmup_frac = s1.get("warmup_frac", 0.10),
+        ema_decay   = s1.get("ema_decay", 0.999),
+        focal_gamma = s1.get("focal_gamma", 2.0),
+        loss_weight = s1.get("loss_weight", 0.5),
+        use_mixup   = use_mixup,
+        mixup_alpha = s1.get("mixup_alpha", 0.4),
         aux_weight = s1.get("aux_weight",    0.1),
         aux_held_rate = s1.get("aux_held_rate", 0.2),
+        remaining_los_weight = s1.get("remaining_los_weight", 0.3),
+        trend_stop_window = s1.get("trend_stop_window", 8),
+        trend_stop_delta  = s1.get("trend_stop_delta", 0.01),
     )
 
     # ── 4. Stage 2 — freeze + dual XGBoost ──────────────────────────────
@@ -390,6 +520,67 @@ def main():
     y_prob_mort = xgb_mort.predict(F_te_mort)
     y_pred_los  = xgb_los.predict_days(F_te_los)
 
+    # ── 5b. Head ablation table (keeps frozen Mamba + XGBoost architecture) ──
+    n_z = 4 * d_model
+    # raw_stats is 5*d_input; optional static starts after that
+    F_tr_enc = F_tr[:, :n_z]
+    F_va_enc = F_va[:, :n_z]
+    F_te_enc = F_te[:, :n_z]
+    F_tr_flat_head = F_tr[:, n_z:]
+    F_va_flat_head = F_va[:, n_z:]
+    F_te_flat_head = F_te[:, n_z:]
+
+    X_tr_flat = _flat_features(seqs, tr_ids)
+    X_va_flat = _flat_features(seqs, va_ids)
+    X_te_flat = _flat_features(seqs, te_ids)
+    # IMPORTANT: train/val loaders are shuffled, so ym_tr/yl_tr coming from
+    # extract_features() are NOT aligned with tr_ids ordering.
+    # For XGBoost-flat, use labels derived from ids to match X_*_flat row order.
+    ym_tr_flat = np.array([y_mort[s] for s in tr_ids], dtype=np.int32)
+    ym_va_flat = np.array([y_mort[s] for s in va_ids], dtype=np.int32)
+    ym_te_flat = np.array([y_mort[s] for s in te_ids], dtype=np.int32)
+    yl_tr_flat = np.array([y_los[s] for s in tr_ids], dtype=np.float32)
+    yl_va_flat = np.array([y_los[s] for s in va_ids], dtype=np.float32)
+    yl_te_flat = np.array([y_los[s] for s in te_ids], dtype=np.float32)
+
+    head_rows = []
+    # 1) XGBoost-flat baseline
+    head_rows.append({
+        "head": "xgboost_flat",
+        **_train_eval_xgb_heads(
+            X_tr_flat, ym_tr_flat, yl_tr_flat,
+            X_va_flat, ym_va_flat, yl_va_flat,
+            X_te_flat, ym_te_flat, yl_te_flat,
+            device=s2["device"],
+        ),
+    })
+    # 2) Encoder head only (z_multi)
+    head_rows.append({
+        "head": "encoder_head",
+        **_train_eval_xgb_heads(
+            F_tr_enc, ym_tr, yl_tr, F_va_enc, ym_va, yl_va, F_te_enc, ym_te, yl_te,
+            device=s2["device"],
+        ),
+    })
+    # 3) Flat head from encoder extraction (raw_stats + static)
+    head_rows.append({
+        "head": "flat_head",
+        **_train_eval_xgb_heads(
+            F_tr_flat_head, ym_tr, yl_tr, F_va_flat_head, ym_va, yl_va, F_te_flat_head, ym_te, yl_te,
+            device=s2["device"],
+        ),
+    })
+    # 4) Hybrid head = your current frozen Mamba + XGBoost stage2
+    head_rows.append({
+        "head": "hybrid_head",
+        "auroc": float(roc_auc_score(ym_te, y_prob_mort)),
+        "auprc": float(average_precision_score(ym_te, y_prob_mort)),
+        "los_mae": float(mean_absolute_error(yl_te, y_pred_los)),
+        "los_rmse": float(np.sqrt(((yl_te - y_pred_los) ** 2).mean())),
+    })
+    _print_head_ablation(head_rows)
+    _save_head_ablation(head_rows, f"{cfg['results_dir']}/head_ablation.csv")
+
     # ── 6. Offline benchmark ─────────────────────────────────────────────
     # FIX 2 — enc_kw forwarded so eval_maboost() loads correct architecture
     bench = OfflineBenchmark(
@@ -417,6 +608,9 @@ def main():
         ]
     if args.skip_new_tests:
         skip_list += ["early_prediction", "sparse_vs_dense", "rolling_prediction"]
+    if sample_to_stay is not None and research_cfg.get("use_observation_window", False):
+        skip_list += ["early_prediction", "sparse_vs_dense", "rolling_prediction", "irregular_gaps"]
+        print("[Benchmark] Skipping legacy temporal subgroup tests in early-sample mode.")
 
     # FIX 3 — baselines wrapped in try/except inside run_all()
     bench_results = bench.run_all(skip=skip_list)
@@ -431,11 +625,11 @@ def main():
 
     full_results = [maboost_result] + [
         r for r in bench_results
-        if r.extra.get("type", "full") == "full"
+        if r.extra.get("table", "full") == "full"
     ]
     new_test_results = [
         r for r in bench_results
-        if r.extra.get("type") in ("early", "sparse_dense", "rolling")
+        if r.extra.get("test") in ("early", "sparse_dense", "rolling", "gap_variance")
     ]
 
     bench.print_table(full_results)
@@ -447,7 +641,7 @@ def main():
             f"{cfg['results_dir']}/benchmark_temporal.csv",
         )
         print(f"[Benchmark] Temporal results saved → "
-              f"{cfg['results_dir']}/benchmark_temporal.csv")
+              f"{cfg['results_dir']}/benchmark_temporal_irregular.csv")
 
     # ── 7. Visualization ─────────────────────────────────────────────────
     save_all(
@@ -505,8 +699,8 @@ def main():
     print("=" * 55)
 
     if new_test_results and not args.skip_new_tests:
-        early   = [r for r in new_test_results if r.extra.get("type") == "early"]
-        rolling = [r for r in new_test_results if r.extra.get("type") == "rolling"]
+        early   = [r for r in new_test_results if r.extra.get("test") == "early"]
+        rolling = [r for r in new_test_results if r.extra.get("test") == "rolling"]
 
         if early:
             print("\n  EARLY PREDICTION SUMMARY")

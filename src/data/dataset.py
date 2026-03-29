@@ -60,6 +60,7 @@ class MaBoostDataset(Dataset):
         mortality_labels: Dict,
         los_labels:       Dict,
         stay_ids:         List,
+        los_remaining_labels: Optional[Dict] = None,
         static_features:  Optional[Dict] = None,
         seq_mean:         Optional[np.ndarray] = None,
         seq_std:          Optional[np.ndarray] = None,
@@ -67,6 +68,7 @@ class MaBoostDataset(Dataset):
         self.seqs   = sequences
         self.mort   = mortality_labels
         self.los    = los_labels
+        self.los_rem = los_remaining_labels
         self.ids    = stay_ids
         self.static = static_features
         self.mean   = seq_mean
@@ -77,7 +79,7 @@ class MaBoostDataset(Dataset):
 
     def __getitem__(self, idx: int):
         sid        = self.ids[idx]
-        seq, tau, mask = self.seqs[sid]
+        seq, tau, mask = self.seqs[sid][:3]
 
         # Work on float32 copies
         x   = seq.copy().astype(np.float32)
@@ -109,6 +111,11 @@ class MaBoostDataset(Dataset):
         y_los  = torch.tensor(
             max(float(self.los[sid]), 0.0), dtype=torch.float32
         )
+        y_los_rem = None
+        if self.los_rem is not None and sid in self.los_rem:
+            y_los_rem = torch.tensor(
+                max(float(self.los_rem[sid]), 0.0), dtype=torch.float32
+            )
 
         if self.static is not None:
             xs = torch.from_numpy(
@@ -116,8 +123,12 @@ class MaBoostDataset(Dataset):
                     self.static[sid].copy(), nan=0.0
                 ).astype(np.float32)
             ).float()
+            if y_los_rem is not None:
+                return x_t, tau_t, mask_t, xs, y_los_rem, y_mort, y_los
             return x_t, tau_t, mask_t, xs, y_mort, y_los
 
+        if y_los_rem is not None:
+            return x_t, tau_t, mask_t, y_los_rem, y_mort, y_los
         return x_t, tau_t, mask_t, y_mort, y_los
 
     # ------------------------------------------------------------------
@@ -139,7 +150,7 @@ class MaBoostDataset(Dataset):
         cnt = np.zeros(n_feats, dtype=np.int64)
 
         for sid in ids:
-            seq, _, mask = sequences[sid]
+            seq, _, mask = sequences[sid][:3]
             m   = (mask > 0).astype(bool)          # (L, F) True = observed
             if not m.any():
                 continue
@@ -176,6 +187,7 @@ def make_loaders(
     val_ids,
     test_ids,
     static_features = None,
+    los_remaining_labels = None,
     batch_size: int = 64,
     num_workers: int = 4,
     oversample_pos: bool = False,
@@ -195,6 +207,7 @@ def make_loaders(
         sequences        = sequences,
         mortality_labels = mortality_labels,
         los_labels       = los_labels,
+        los_remaining_labels = los_remaining_labels,
         static_features  = static_features,
         seq_mean         = mean,
         seq_std          = std,

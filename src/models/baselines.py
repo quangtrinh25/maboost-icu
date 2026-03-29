@@ -644,8 +644,9 @@ class Strats(TimeSeriesModel):
         attention_weights = self.fusion_att(contextual_emb, obs_mask)[:, :, None]
         ts_emb            = (contextual_emb * attention_weights).sum(dim=1)
 
-        demo_emb    = self.demo_emb(demo)
-        ts_demo_emb = torch.cat((ts_emb, demo_emb), dim=-1)
+        # istrats: TimeSeriesModel uses raw demo (hid_dim + D); other types use demo_emb → hid_dim
+        demo_part = self.demo_emb(demo) if hasattr(self, "demo_emb") else demo
+        ts_demo_emb = torch.cat((ts_emb, demo_part), dim=-1)
         logits      = self.binary_head(ts_demo_emb)[:, 0]
         return self.binary_cls_final(logits, labels)
 

@@ -41,7 +41,7 @@ from sklearn.metrics import (roc_auc_score, average_precision_score,
 
 from src.models.mamba_encoder import MambaEncoder
 from src.models.xgboost_head  import XGBMortality, XGBLos
-from src.training.stage2_train import extract_features
+from src.training.stage2_train import extract_features, apply_stage2_transforms
 
 
 @dataclass
@@ -58,7 +58,7 @@ class BenchResult:
 def _flat(sequences: dict, ids: list) -> np.ndarray:
     rows = []
     for s in ids:
-        seq, _, mask = sequences[s]
+        seq, _, mask = sequences[s][:3]
         r = []
         for j in range(seq.shape[1]):
             v   = seq[:, j]
@@ -86,7 +86,7 @@ def _cut_sequences(sequences: dict, ids: list,
     PAD_TAU = 60.0
     cut = {}
     for sid in ids:
-        seq, tau, mask = sequences[sid]
+        seq, tau, mask = sequences[sid][:3]
         valid_rows = (mask.sum(axis=1) > 0)
         if not valid_rows.any():
             cut[sid] = (seq.copy(), tau.copy(), mask.copy())
@@ -115,7 +115,7 @@ def _cut_sequences(sequences: dict, ids: list,
 def _gap_variance(sequences: dict, ids: list) -> np.ndarray:
     variances = []
     for sid in ids:
-        _, tau, mask = sequences[sid]
+        _, tau, mask = sequences[sid][:3]
         valid = mask.sum(axis=1) > 0
         variances.append(float(tau[valid].std()) if valid.sum() > 1 else 0.0)
     return np.array(variances)
@@ -197,8 +197,10 @@ class OfflineBenchmark:
         enc = _load_encoder(self.enc_path, self.d_input, self.d_model, self.enc_kw, self.device)
         xgb_m, xgb_l = _load_xgb(self.mort_path, self.los_path)
         F, ym, yl = extract_features(enc, self.te_loader, self.device)
-        return self._result("MaBoost (ours)", ym, xgb_m.predict(F), yl,
-                            xgb_l.predict_days(F), extra={"table": "full"})
+        F_m = apply_stage2_transforms(F, ckpt_dir=str(Path(self.mort_path).parent), for_mortality=True)
+        F_l = apply_stage2_transforms(F, ckpt_dir=str(Path(self.mort_path).parent), for_mortality=False)
+        return self._result("MaBoost (ours)", ym, xgb_m.predict(F_m), yl,
+                            xgb_l.predict_days(F_l), extra={"table": "full"})
 
     def eval_xgb_flat(self):
         t0 = time.perf_counter()
@@ -215,7 +217,7 @@ class OfflineBenchmark:
     def _extract_cut_features(self, enc, h):
         """
         Extract features from encoder using sequences cut at h hours.
-        Returns (F_tr, ym_tr, yl_tr, F_va, ym_va, yl_va, F_te, ym_te, yl_te).
+        Returns encoder features plus flat features and labels aligned to flat-feature row order.
         """
         seqs_tr = _cut_sequences(self.seqs, self.tr, h, self._seq_len)
         seqs_va = _cut_sequences(self.seqs, self.va, h, self._seq_len)
@@ -235,6 +237,12 @@ class OfflineBenchmark:
         X_tr = _flat(seqs_tr, self.tr)
         X_va = _flat(seqs_va, self.va)
         X_te = _flat(seqs_te, self.te)
+        ym_tr_flat = np.array([self.y_mort[s] for s in self.tr], dtype=np.int32)
+        ym_va_flat = np.array([self.y_mort[s] for s in self.va], dtype=np.int32)
+        ym_te_flat = np.array([self.y_mort[s] for s in self.te], dtype=np.int32)
+        yl_tr_flat = np.array([self.y_los[s] for s in self.tr], dtype=np.float32)
+        yl_va_flat = np.array([self.y_los[s] for s in self.va], dtype=np.float32)
+        yl_te_flat = np.array([self.y_los[s] for s in self.te], dtype=np.float32)
 
         n_ts_avg = float(np.mean([
             int((seqs_te[s][2].sum(axis=1) > 0).sum()) for s in self.te
@@ -244,6 +252,8 @@ class OfflineBenchmark:
                 F_va, ym_va, yl_va,
                 F_te, ym_te, yl_te,
                 X_tr, X_va, X_te,
+                ym_tr_flat, ym_va_flat, ym_te_flat,
+                yl_tr_flat, yl_va_flat, yl_te_flat,
                 n_ts_avg)
 
     def eval_early_prediction(self, hours=[6.0, 12.0, 24.0]):
@@ -280,6 +290,8 @@ class OfflineBenchmark:
              F_va, ym_va, yl_va,
              F_te, ym_te, yl_te,
              X_tr, X_va, X_te,
+             ym_tr_flat, ym_va_flat, ym_te_flat,
+             yl_tr_flat, yl_va_flat, yl_te_flat,
              n_ts_avg) = self._extract_cut_features(enc, h)
 
             # MaBoost — retrain XGBoost HEAD on cut encoder features
@@ -291,12 +303,15 @@ class OfflineBenchmark:
             yp_los = xgb_l_cut.predict_days(F_te)
 
             # XGBoost-flat — retrain on cut flat features
-            m_flat, l_flat = _train_xgb_flat(X_tr, ym_tr, yl_tr, X_va, ym_va, yl_va)
+            m_flat, l_flat = _train_xgb_flat(
+                X_tr, ym_tr_flat, yl_tr_flat,
+                X_va, ym_va_flat, yl_va_flat,
+            )
             yp_flat     = m_flat.predict(X_te)
             yp_los_flat = l_flat.predict_days(X_te)
 
             auroc_mb   = float(roc_auc_score(ym_te, yp_mb))
-            auroc_flat = float(roc_auc_score(ym_te, yp_flat))
+            auroc_flat = float(roc_auc_score(ym_te_flat, yp_flat))
             delta      = auroc_mb - auroc_flat
 
             print(f"  {h:>4.0f}h  {auroc_mb:>8.4f}  {auroc_flat:>9.4f}  "
@@ -307,7 +322,7 @@ class OfflineBenchmark:
                 extra={"hours": h, "n_ts_avg": n_ts_avg,
                        "table": "irregular", "test": "early"}))
             results.append(self._result(
-                f"XGB-flat@{h:.0f}h", ym_te, yp_flat, yl_te, yp_los_flat,
+                f"XGB-flat@{h:.0f}h", ym_te_flat, yp_flat, yl_te_flat, yp_los_flat,
                 extra={"hours": h, "n_ts_avg": n_ts_avg,
                        "table": "irregular", "test": "early"}))
 
@@ -347,8 +362,10 @@ class OfflineBenchmark:
                 self.tr, self.va, group_ids,
                 static_features=self._static, batch_size=self.batch_sz)
             F_grp, ym_grp, yl_grp = extract_features(enc, te_grp, self.device)
-            yp_mb  = xgb_m.predict(F_grp)
-            yp_los = xgb_l.predict_days(F_grp)
+            F_grp_m = apply_stage2_transforms(F_grp, ckpt_dir=str(Path(self.mort_path).parent), for_mortality=True)
+            F_grp_l = apply_stage2_transforms(F_grp, ckpt_dir=str(Path(self.mort_path).parent), for_mortality=False)
+            yp_mb  = xgb_m.predict(F_grp_m)
+            yp_los = xgb_l.predict_days(F_grp_l)
 
             X_grp  = _flat(self.seqs, group_ids)
             m_flat, l_flat = _train_xgb_flat(
@@ -397,6 +414,8 @@ class OfflineBenchmark:
              F_va, ym_va, yl_va,
              F_te, ym_te, yl_te,
              X_tr, X_va, X_te,
+             ym_tr_flat, ym_va_flat, ym_te_flat,
+             yl_tr_flat, yl_va_flat, yl_te_flat,
              n_ts_avg) = self._extract_cut_features(enc, h)
 
             # MaBoost — retrain XGBoost HEAD
@@ -408,12 +427,15 @@ class OfflineBenchmark:
             yp_los = xgb_l_cut.predict_days(F_te)
 
             # XGBoost-flat — retrain
-            m_flat, l_flat = _train_xgb_flat(X_tr, ym_tr, yl_tr, X_va, ym_va, yl_va)
+            m_flat, l_flat = _train_xgb_flat(
+                X_tr, ym_tr_flat, yl_tr_flat,
+                X_va, ym_va_flat, yl_va_flat,
+            )
             yp_flat     = m_flat.predict(X_te)
             yp_los_flat = l_flat.predict_days(X_te)
 
             auroc_mb   = float(roc_auc_score(ym_te, yp_mb))
-            auroc_flat = float(roc_auc_score(ym_te, yp_flat))
+            auroc_flat = float(roc_auc_score(ym_te_flat, yp_flat))
             delta      = auroc_mb - auroc_flat
 
             print(f"  {h:>4.0f}h  {auroc_mb:>8.4f}  {auroc_flat:>9.4f}  "
@@ -424,7 +446,7 @@ class OfflineBenchmark:
                 extra={"hours": h, "n_ts_avg": n_ts_avg,
                        "table": "irregular", "test": "rolling"}))
             results.append(self._result(
-                f"XGB-flat@{h:.0f}h", ym_te, yp_flat, yl_te, yp_los_flat,
+                f"XGB-flat@{h:.0f}h", ym_te_flat, yp_flat, yl_te_flat, yp_los_flat,
                 extra={"hours": h, "n_ts_avg": n_ts_avg,
                        "table": "irregular", "test": "rolling"}))
 
@@ -473,8 +495,10 @@ class OfflineBenchmark:
                 self.tr, self.va, group_ids,
                 static_features=self._static, batch_size=self.batch_sz)
             F_grp, ym_grp, yl_grp = extract_features(enc, te_grp, self.device)
-            yp_mb  = xgb_m.predict(F_grp)
-            yp_los = xgb_l.predict_days(F_grp)
+            F_grp_m = apply_stage2_transforms(F_grp, ckpt_dir=str(Path(self.mort_path).parent), for_mortality=True)
+            F_grp_l = apply_stage2_transforms(F_grp, ckpt_dir=str(Path(self.mort_path).parent), for_mortality=False)
+            yp_mb  = xgb_m.predict(F_grp_m)
+            yp_los = xgb_l.predict_days(F_grp_l)
 
             X_grp  = _flat(self.seqs, group_ids)
             m_flat, l_flat = _train_xgb_flat(
