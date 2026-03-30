@@ -66,6 +66,7 @@ class MaBoostOnlinePipeline:
         thresh_mild:   float = 0.05,
         thresh_severe: float = 0.10,
         history_len:   int   = 48,
+        obs_window_hours: float | None = None,
         device:        str   = "cuda",
     ):
         assert all(not p.requires_grad for p in encoder.parameters())
@@ -75,12 +76,37 @@ class MaBoostOnlinePipeline:
         self.thresh_mild   = thresh_mild
         self.thresh_severe = thresh_severe
         self.history_len   = history_len
+        self.obs_window_hours = obs_window_hours
         self.device        = device
         self.auc_tracker   = river_metrics.ROCAUC()
         self.auc_history:  List[float] = []
         self.n_updates     = 0
         self._hist: Dict[str, deque] = {}
         self.ckpt_dir: str | None = None
+
+    # ------------------------------------------------------------------
+    def _trim_history(
+        self,
+        hist: list[tuple[np.ndarray, float, np.ndarray]],
+    ) -> list[tuple[np.ndarray, float, np.ndarray]]:
+        if not hist:
+            return hist
+        if self.obs_window_hours is None or self.obs_window_hours <= 0:
+            return hist[-self.history_len :]
+
+        max_seconds = float(self.obs_window_hours) * 3600.0
+        start_idx = len(hist) - 1
+        elapsed = 0.0
+        for i in range(len(hist) - 1, -1, -1):
+            start_idx = i
+            if i < len(hist) - 1:
+                elapsed += float(np.nan_to_num(
+                    hist[i + 1][1], nan=60.0, posinf=3600.0, neginf=1.0
+                ))
+                if elapsed > max_seconds:
+                    start_idx = i + 1
+                    break
+        return hist[max(start_idx, len(hist) - self.history_len):]
 
     # ------------------------------------------------------------------
     def _build_feature_vector(
@@ -92,17 +118,20 @@ class MaBoostOnlinePipeline:
     ) -> np.ndarray:
         if stay_id not in self._hist:
             self._hist[stay_id] = deque(maxlen=self.history_len)
-        self._hist[stay_id].append((x_new.ravel().astype(np.float32), tau_new))
+        x_arr = np.asarray(x_new, dtype=np.float32).ravel()
+        mask_arr = np.isfinite(x_arr).astype(np.float32)
+        x_arr = np.nan_to_num(x_arr, nan=0.0, posinf=0.0, neginf=0.0)
+        self._hist[stay_id].append((x_arr, tau_new, mask_arr))
 
-        hist = list(self._hist[stay_id])
+        hist = self._trim_history(list(self._hist[stay_id]))
         seq  = np.stack([h[0] for h in hist]).astype(np.float32)
         taus = np.array([h[1] for h in hist], dtype=np.float32)
+        masks = np.stack([h[2] for h in hist]).astype(np.float32)
 
         with torch.no_grad():
             xt     = torch.from_numpy(seq).float().unsqueeze(0).to(self.device)
             tt     = torch.from_numpy(taus).float().unsqueeze(0).to(self.device)
-            # All rows in history are real observed timesteps.
-            mask_t = torch.ones(1, len(hist), dtype=torch.float32).to(self.device)
+            mask_t = torch.from_numpy(masks).float().unsqueeze(0).to(self.device)
             z_multi, raw_stats = self.enc.extract_features(xt, tt, mask_t)
 
         F_base = np.hstack([

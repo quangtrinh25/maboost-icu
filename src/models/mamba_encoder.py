@@ -191,10 +191,15 @@ class MambaEncoder(nn.Module):
                  d_conv: int = 4, expand: int = 2, n_layers: int = 3,
                  n_heads: int = 4, dropout: float = 0.1, topk: int = 5,
                  use_circadian: bool = True,
-                 ref_points: int = 32, window_hours: float = 48.0):
+                 ref_points: int = 32, window_hours: float = 48.0,
+                 event_token_mode: bool = False,
+                 event_max_tokens: int = 96):
         super().__init__()
         self.d_input    = d_input
         self.ref_points = ref_points
+        self.window_hours = window_hours
+        self.event_token_mode = bool(event_token_mode)
+        self.event_max_tokens = int(max(event_max_tokens, 1))
 
         self.imputer    = GRUDImputer(d_input)
         self.sci        = SCI(d_input, ref_points, window_hours)
@@ -204,6 +209,14 @@ class MambaEncoder(nn.Module):
         )
         self.t_emb  = TimeEmbedding(d_model, use_circadian=use_circadian)
         self.t_fuse = nn.Linear(d_model * 2, d_model)
+        if self.event_token_mode:
+            self.event_value_proj = nn.Sequential(
+                nn.Linear(1, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
+            )
+            self.event_var_emb = nn.Embedding(d_input + 1, d_model, padding_idx=0)
+            self.event_fuse = nn.Sequential(
+                nn.Linear(d_model * 3, d_model), nn.LayerNorm(d_model)
+            )
         self.layers = nn.ModuleList([
             MambaBlock(d_model, d_state, d_conv, expand, dropout)
             for _ in range(n_layers)
@@ -214,27 +227,30 @@ class MambaEncoder(nn.Module):
     def forward(self, x: torch.Tensor, tau: torch.Tensor,
                 mask: Optional[torch.Tensor] = None,
                 t_abs: Optional[torch.Tensor] = None) -> torch.Tensor:
-        h = self._encode(x, tau, mask, t_abs)
-        return self.pool(h, mask=None)
+        h, seq_mask = self._encode(x, tau, mask, t_abs)
+        return self.pool(h, mask=seq_mask)
 
     def extract_features(self, x: torch.Tensor, tau: torch.Tensor,
                          mask: Optional[torch.Tensor] = None,
                          t_abs: Optional[torch.Tensor] = None,
                          ) -> Tuple[torch.Tensor, torch.Tensor]:
-        h         = self._encode(x, tau, mask, t_abs)
-        z_multi   = self.pool.extract(h, mask=None)
+        h, seq_mask = self._encode(x, tau, mask, t_abs)
+        z_multi   = self.pool.extract(h, mask=seq_mask)
         raw_stats = self._raw_stats(x, mask)
         return z_multi, raw_stats
 
     def _encode(self, x: torch.Tensor, tau: torch.Tensor,
                 mask: Optional[torch.Tensor],
-                t_abs: Optional[torch.Tensor] = None) -> torch.Tensor:
+                t_abs: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         if mask is None:
             mask_3d = torch.ones_like(x)
         elif mask.dim() == 2:
             mask_3d = mask.unsqueeze(-1).expand_as(x)
         else:
             mask_3d = mask
+
+        if self.event_token_mode:
+            return self._encode_event_tokens(x, tau, mask_3d, t_abs)
 
         x_hat = self.imputer(x, tau, mask_3d)
         sigma, lam, gamma = self.sci(x_hat, mask_3d, tau)
@@ -251,11 +267,94 @@ class MambaEncoder(nn.Module):
             h = layer(h, ref_tau)
 
         h = self.norm(h)
-        return torch.nan_to_num(h, nan=0.0, posinf=1.0, neginf=-1.0)
+        ref_mask = (lam.sum(dim=-1) > 0).float()
+        h = torch.nan_to_num(h, nan=0.0, posinf=1.0, neginf=-1.0)
+        return h, ref_mask
+
+    def _event_tokenize(
+        self,
+        x: torch.Tensor,
+        tau: torch.Tensor,
+        mask_3d: torch.Tensor,
+        t_abs: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Convert the irregular multivariate window into APRICOT-style event tokens:
+        one token per observed (timestamp, variable) pair, with explicit value,
+        variable id, and inter-event gap.
+        """
+        B, _, _ = x.shape
+        K = self.event_max_tokens
+        device = x.device
+
+        tok_val = x.new_zeros((B, K, 1))
+        tok_tau = tau.new_full((B, K), 1.0)
+        tok_abs = tau.new_zeros((B, K))
+        tok_var = torch.zeros((B, K), dtype=torch.long, device=device)
+        tok_mask = x.new_zeros((B, K))
+
+        row_abs = tau.cumsum(dim=1) if t_abs is None else t_abs
+
+        for b in range(B):
+            rows, cols = torch.nonzero(mask_3d[b] > 0, as_tuple=True)
+            if rows.numel() == 0:
+                continue
+
+            if rows.numel() > K:
+                rows = rows[-K:]
+                cols = cols[-K:]
+
+            tok_vals_b = x[b, rows, cols]
+            tok_vars_b = cols.to(torch.long) + 1
+            tok_abs_b = row_abs[b, rows]
+            tok_tau_b = tau[b, rows].clone()
+            if tok_tau_b.numel() > 1:
+                same_row = rows[1:] == rows[:-1]
+                tok_tau_b[1:] = torch.where(
+                    same_row,
+                    torch.ones_like(tok_tau_b[1:]),
+                    tok_tau_b[1:],
+                )
+            tok_tau_b = tok_tau_b.clamp(min=1.0, max=86400.0)
+
+            n_tok = int(tok_vals_b.numel())
+            offset = K - n_tok
+            tok_val[b, offset:, 0] = tok_vals_b.float()
+            tok_tau[b, offset:] = tok_tau_b.float()
+            tok_abs[b, offset:] = tok_abs_b.float()
+            tok_var[b, offset:] = tok_vars_b
+            tok_mask[b, offset:] = 1.0
+
+        return tok_val, tok_tau, tok_var, tok_mask, tok_abs
+
+    def _encode_event_tokens(
+        self,
+        x: torch.Tensor,
+        tau: torch.Tensor,
+        mask_3d: torch.Tensor,
+        t_abs: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        tok_val, tok_tau, tok_var, tok_mask, tok_abs = self._event_tokenize(
+            x, tau, mask_3d, t_abs
+        )
+        val_emb = self.event_value_proj(tok_val)
+        var_emb = self.event_var_emb(tok_var)
+        time_emb = self.t_emb(tok_tau, tok_abs)
+        h = self.event_fuse(torch.cat([val_emb, var_emb, time_emb], dim=-1))
+
+        valid = tok_mask.unsqueeze(-1)
+        h = h * valid
+        for layer in self.layers:
+            h = layer(h, tok_tau)
+            h = h * valid
+
+        h = self.norm(h) * valid
+        h = torch.nan_to_num(h, nan=0.0, posinf=1.0, neginf=-1.0)
+        return h, tok_mask
 
     def _ref_tau(self, tau: torch.Tensor) -> torch.Tensor:
         B  = tau.shape[0]
-        dt = 48.0 * 3600.0 / self.ref_points
+        dt = self.window_hours * 3600.0 / self.ref_points
         return torch.full((B, self.ref_points), dt,
                           dtype=tau.dtype, device=tau.device)
 

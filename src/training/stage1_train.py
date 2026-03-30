@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.utils.data import DataLoader
 
 from mamba_ssm import Mamba
@@ -114,13 +114,15 @@ def _warmup_cosine(step, total, warmup, min_r=0.01):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def _eval(model: DualHeadMamba, loader: DataLoader, device: str) -> float:
+def _eval_metrics(model: DualHeadMamba, loader: DataLoader, device: str) -> dict:
     model.eval()
     probs, labels = [], []
     for batch in loader:
         x, tau, mask = (batch[i].to(device) for i in range(3))
-        x_static     = batch[3].to(device) if len(batch) == 6 else None
-        logits, _    = model(x, tau, mask, x_static=x_static)
+        # IMPORTANT: Stage 1 saves only model.encoder.state_dict(), not the
+        # temporary static branch or prediction heads. Checkpoint selection must
+        # therefore score encoder quality directly, without x_static.
+        logits, _    = model(x, tau, mask, x_static=None)
         probs.append(torch.softmax(logits.float(), -1)[:, 1].cpu())
         labels.append(batch[-2].cpu())
 
@@ -128,8 +130,12 @@ def _eval(model: DualHeadMamba, loader: DataLoader, device: str) -> float:
     l = np.nan_to_num(torch.cat(labels).numpy(), nan=0.0).astype(int)
     p = np.clip(p, 1e-7, 1.0 - 1e-7)
     if l.sum() == 0 or (1 - l).sum() == 0:
-        return 0.5
-    return float(roc_auc_score(l, p))
+        base = float(l.mean()) if len(l) > 0 else 0.0
+        return {"auroc": 0.5, "auprc": base}
+    return {
+        "auroc": float(roc_auc_score(l, p)),
+        "auprc": float(average_precision_score(l, p)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -208,11 +214,13 @@ def train_stage1(
     loss_weight:  float = 0.5,
     use_mixup:    bool  = True,
     mixup_alpha:  float = 0.4,
+    oversample_pos: bool = False,
     aux_weight:   float = 0.1,
     aux_held_rate: float = 0.2,
     remaining_los_weight: float = 0.3,
     trend_stop_window: int = 8,
     trend_stop_delta: float = 0.01,
+    selection_metric: str = "auroc",
 ) -> DualHeadMamba:
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
     ckpt  = Path(ckpt_dir) / "encoder_best.pth"
@@ -247,10 +255,13 @@ def train_stage1(
     n_neg = n_tot - n_pos
     print(f"[Stage 1] pos={n_pos:,} neg={n_neg:,} ({100*n_pos/max(n_tot,1):.1f}%)")
 
-    w_neg = 1.0 / max(n_neg, 1)
-    w_pos = 1.0 / max(n_pos, 1)
-    total = w_neg + w_pos
-    alpha = torch.tensor([w_neg / total, w_pos / total], device=device)
+    if oversample_pos:
+        alpha = torch.tensor([0.5, 0.5], device=device)
+    else:
+        w_neg = 1.0 / max(n_neg, 1)
+        w_pos = 1.0 / max(n_pos, 1)
+        total = w_neg + w_pos
+        alpha = torch.tensor([w_neg / total, w_pos / total], device=device)
     focal = FocalLoss(alpha=alpha, gamma=focal_gamma)
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr,
@@ -261,15 +272,21 @@ def train_stage1(
         opt, lr_lambda=lambda s: _warmup_cosine(s, total_steps, warmup_steps)
     )
 
-    use_aux = aux_weight > 0.0
-    print(f"[Stage 1] float32 | mixup={use_mixup} | γ={focal_gamma} | "
+    use_event_tokens = bool(getattr(model.encoder, "event_token_mode", False))
+    use_aux = aux_weight > 0.0 and not use_event_tokens
+    selection_metric = str(selection_metric).lower().strip()
+    if selection_metric not in {"auroc", "auprc"}:
+        selection_metric = "auroc"
+
+    print(f"[Stage 1] float32 | mixup={use_mixup} | oversample={oversample_pos} | γ={focal_gamma} | "
           f"warmup={warmup_frac:.0%} | nan_hooks=ON | "
-          f"aux_loss={'ON w=' + str(aux_weight) if use_aux else 'OFF'}")
+          f"aux_loss={'OFF(event_tokens)' if (aux_weight > 0.0 and use_event_tokens) else ('ON w=' + str(aux_weight) if use_aux else 'OFF')} | "
+          f"select={selection_metric.upper()}")
 
     ema      = ModelEMA(model, decay=ema_decay)
-    best_auc = 0.0
+    best_score = -np.inf
     no_imp   = 0
-    auc_hist = []
+    score_hist = []
     print(f"[Stage 1] Training — up to {epochs} epochs  patience={patience}")
 
     for ep in range(1, epochs + 1):
@@ -371,8 +388,11 @@ def train_stage1(
 
         saved_state = copy.deepcopy(model.state_dict())
         ema.apply(model)
-        auc = _eval(model, val_loader, device)
-        auc_hist.append(float(auc))
+        val_metrics = _eval_metrics(model, val_loader, device)
+        auroc = float(val_metrics["auroc"])
+        auprc = float(val_metrics["auprc"])
+        score = auprc if selection_metric == "auprc" else auroc
+        score_hist.append(float(score))
         model.load_state_dict(saved_state)
 
         nb = max(n_ok, 1)
@@ -382,26 +402,26 @@ def train_stage1(
             f"  ep {ep:3d}/{epochs} | "
             f"loss={ep_loss/nb:.4f} "
             f"(m={ep_lm/nb:.4f} l={ep_ll/nb:.4f}{lr_str}{aux_str}) | "
-            f"grad={ep_grad/nb:.3f} | AUC={auc:.4f}"
+            f"grad={ep_grad/nb:.3f} | AUROC={auroc:.4f} | AUPRC={auprc:.4f}"
             + (f" [{n_skip} skip]" if n_skip else "")
         )
 
-        if auc > best_auc + 1e-4:
-            best_auc, no_imp = auc, 0
+        if score > best_score + 1e-4:
+            best_score, no_imp = score, 0
             ema.apply(model)
             torch.save(model.encoder.state_dict(), ckpt)
             model.load_state_dict(saved_state)
-            print(f"    ✓ AUC {best_auc:.4f} — saved")
+            print(f"    ✓ {selection_metric.upper()} {best_score:.4f} — saved")
         else:
             no_imp += 1
-            if trend_stop_window > 1 and len(auc_hist) >= trend_stop_window:
-                recent = auc_hist[-trend_stop_window:]
+            if trend_stop_window > 1 and len(score_hist) >= trend_stop_window:
+                recent = score_hist[-trend_stop_window:]
                 head = recent[: trend_stop_window // 2]
                 tail = recent[trend_stop_window // 2 :]
                 if len(head) > 0 and len(tail) > 0:
                     if (float(np.mean(head)) - float(np.mean(tail))) >= trend_stop_delta:
                         print(
-                            f"  Trend-stop at epoch {ep}: recent AUC drop "
+                            f"  Trend-stop at epoch {ep}: recent {selection_metric.upper()} drop "
                             f"{float(np.mean(head)) - float(np.mean(tail)):.4f} "
                             f"(window={trend_stop_window})"
                         )
@@ -413,5 +433,5 @@ def train_stage1(
     model.encoder.load_state_dict(
         torch.load(ckpt, map_location=device, weights_only=True)
     )
-    print(f"[Stage 1] Done. Best val AUC: {best_auc:.4f}")
+    print(f"[Stage 1] Done. Best val {selection_metric.upper()}: {best_score:.4f}")
     return model

@@ -355,6 +355,7 @@ def _optuna_search(
     booster: str = "gbtree",
     depth_max: int = 10,
     n_estimators_max: int = 2000,
+    score_metric: str = "auroc",
 ) -> dict:
     try:
         import optuna
@@ -363,8 +364,13 @@ def _optuna_search(
         print("  [Optuna] not installed — using default params")
         return {}
 
-    metric   = "auc" if objective == "binary:logistic" else "rmse"
-    maximize = metric == "auc"
+    score_metric = str(score_metric).lower().strip()
+    if objective == "binary:logistic":
+        metric = "aucpr" if score_metric == "auprc" else "auc"
+        maximize = True
+    else:
+        metric = "rmse"
+        maximize = False
     use_dart = booster == "dart"
     depth_hi = min(int(depth_max), 8)   # avoid extreme GPU memory spikes
     n_hi     = min(int(n_estimators_max), 1200)
@@ -429,9 +435,13 @@ def _optuna_search(
             raise
 
         pred = bst.predict(dm_va)
-        from sklearn.metrics import roc_auc_score, mean_squared_error
+        from sklearn.metrics import average_precision_score, mean_squared_error, roc_auc_score
         if objective == "binary:logistic":
-            score = roc_auc_score(y_va, pred)
+            score = (
+                average_precision_score(y_va, pred)
+                if score_metric == "auprc"
+                else roc_auc_score(y_va, pred)
+            )
         else:
             score = -np.sqrt(mean_squared_error(y_va, pred))
 
@@ -530,13 +540,14 @@ def _train_single_mort_booster(
     early_stopping: int,
     use_dart: bool,
     seed: int,
+    stop_metric: str = "auc",
 ) -> xgb.Booster:
     """Train one mortality booster with a given seed."""
     p = {**full_p, "seed": seed}
     callbacks = None
     if not use_dart and early_stopping > 0:
         callbacks = [xgb.callback.EarlyStopping(
-            early_stopping, "auc", maximize=True, save_best=True
+            early_stopping, stop_metric, maximize=True, save_best=True
         )]
     try:
         bst = xgb.train(p, dm_tr, n_rounds,
@@ -575,6 +586,7 @@ def train_stage2(
     optuna_depth_max: int = 10,
     optuna_n_max: int = 2000,
     use_dart: bool = False,
+    mortality_opt_metric: str = "auroc",
     use_calibration: bool = True,
     use_isotonic: bool = True,
     drop_low_importance: bool = True,
@@ -632,6 +644,11 @@ def train_stage2(
     # ── MORTALITY MODEL ───────────────────────────────────────────────────
     print("\n[Stage 2] Training mortality XGBoost …")
 
+    mortality_opt_metric = str(mortality_opt_metric).lower().strip()
+    if mortality_opt_metric not in {"auroc", "auprc"}:
+        mortality_opt_metric = "auroc"
+    xgb_mort_eval_metric = "aucpr" if mortality_opt_metric == "auprc" else "auc"
+
     if use_optuna:
         print(f"  Running Optuna search ({n_optuna_trials} trials) …")
         best_p = _optuna_search(
@@ -640,6 +657,7 @@ def train_stage2(
             booster=booster_type,
             depth_max=optuna_depth_max,
             n_estimators_max=optuna_n_max,
+            score_metric=mortality_opt_metric,
         )
         params_m = {**default_p, **best_p}
     else:
@@ -651,7 +669,7 @@ def train_stage2(
 
     full_p_m = {
         "objective":         "binary:logistic",
-        "eval_metric":       ["auc", "logloss"],
+        "eval_metric":       [xgb_mort_eval_metric, "logloss"],
         "tree_method":       "hist",
         "booster":           booster_type,
         "device":            xgb_device,
@@ -676,7 +694,7 @@ def train_stage2(
         print(f"  [Ensemble] seed={seed}")
         bst = _train_single_mort_booster(
             full_p_m, dm_tr_m, dm_va_m, n_rounds,
-            early_stopping, use_dart, seed
+            early_stopping, use_dart, seed, stop_metric=xgb_mort_eval_metric
         )
         bst_ensemble.append(bst)
 
@@ -695,7 +713,7 @@ def train_stage2(
         for seed in ensemble_seeds:
             bst = _train_single_mort_booster(
                 full_p_m, dm_tr_m2, dm_va_m2, n_rounds,
-                early_stopping, use_dart, seed
+                early_stopping, use_dart, seed, stop_metric=xgb_mort_eval_metric
             )
             bst_ensemble.append(bst)
         bst_m = bst_ensemble[0]

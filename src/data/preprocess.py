@@ -742,6 +742,11 @@ def run_etl(
         static_features  = static,
         mortality_labels = y_mort,
         los_labels       = y_los,
+        stay_subjects    = {
+            int(r["icustay_id"]): int(r["subject_id"])
+            for r in icu.iter_rows(named=True)
+            if r.get("icustay_id") is not None and r.get("subject_id") is not None
+        },
         feature_names    = FEATURE_NAMES,
         static_names     = STATIC_NAMES,
         stay_outcomes    = stay_outcomes,

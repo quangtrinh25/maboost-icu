@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 
@@ -82,14 +82,82 @@ def _window_and_pad(
     return s_pad, t_pad, m_pad
 
 
+def _select_cutpoints(
+    valid_idxs: np.ndarray,
+    elapsed_s: np.ndarray,
+    anchor_mode: str,
+    min_elapsed_s: float,
+    step_s: float,
+    min_anchor_gap_s: float,
+) -> List[int]:
+    """
+    Select cutpoints from valid observation rows.
+
+    anchor_mode:
+      - "step":  legacy periodic anchors every `step_s`
+      - "event": anchor whenever a new observed timestamp arrives,
+                 optionally respecting `min_anchor_gap_s`
+    """
+    cutpoints: List[int] = []
+    mode = str(anchor_mode).lower().strip()
+
+    if mode == "event":
+        last_anchor_s = None
+        for i in valid_idxs:
+            t_s = float(elapsed_s[i])
+            if t_s < min_elapsed_s:
+                continue
+            if last_anchor_s is None or (t_s - last_anchor_s) >= min_anchor_gap_s:
+                cutpoints.append(int(i))
+                last_anchor_s = t_s
+        if len(valid_idxs) > 0 and int(valid_idxs[-1]) not in cutpoints:
+            cutpoints.append(int(valid_idxs[-1]))
+        return cutpoints
+
+    next_thr = min_elapsed_s
+    for i in valid_idxs:
+        if float(elapsed_s[i]) >= next_thr:
+            cutpoints.append(int(i))
+            next_thr += step_s
+    if len(valid_idxs) > 0 and int(valid_idxs[-1]) not in cutpoints:
+        cutpoints.append(int(valid_idxs[-1]))
+    return cutpoints
+
+
+def _window_meta(
+    tau: np.ndarray,
+    mask: np.ndarray,
+    anchor_elapsed_hours: float,
+) -> Dict[str, float]:
+    valid = (mask.sum(axis=1) > 0)
+    n_timestamps = int(valid.sum())
+    obs_count = int(mask.sum())
+    if n_timestamps > 1:
+        tau_valid = np.nan_to_num(
+            tau[valid], nan=PAD_TAU, posinf=3600.0, neginf=1.0
+        ).astype(np.float32)
+        gap_std_s = float(np.std(tau_valid[1:]))
+    else:
+        gap_std_s = 0.0
+    return {
+        "anchor_elapsed_hours": float(anchor_elapsed_hours),
+        "n_timestamps": n_timestamps,
+        "obs_count": obs_count,
+        "gap_std_s": gap_std_s,
+    }
+
+
 def build_event_driven_samples(
     sequences: Dict,
     mortality_labels: Dict,
     los_labels: Dict,
     stay_outcomes: Optional[Dict] = None,
     static_features: Optional[Dict] = None,
+    stay_subjects: Optional[Dict] = None,
+    anchor_mode: str = "step",
     min_elapsed_hours: float = 6.0,
     step_hours: float = 6.0,
+    min_anchor_gap_minutes: float = 0.0,
     max_samples_per_stay: int = 64,
     obs_window_hours: Optional[float] = None,
     mortality_horizon_hours: Optional[float] = None,
@@ -102,6 +170,8 @@ def build_event_driven_samples(
       - sequences, mortality_labels, los_labels, los_remaining_labels
       - static_features
       - sample_to_stay (for group-aware split)
+      - sample_to_subject
+      - sample_metadata
 
     If obs_window_hours is set, each sample contains only the trailing
     observation window ending at the cutpoint. This is better aligned with
@@ -113,6 +183,10 @@ def build_event_driven_samples(
     los_target:
       - "remaining": predict remaining ICU LOS at each cutpoint
       - "total":     predict total ICU LOS (legacy behavior)
+
+    max_samples_per_stay:
+      - > 0: downsample anchors to this many cutpoints per stay
+      - <=0: keep all selected anchors
     """
     out_seq = {}
     out_m = {}
@@ -120,9 +194,12 @@ def build_event_driven_samples(
     out_l_rem = {}
     out_static = {}
     sample_to_stay = {}
+    sample_to_subject = {}
+    sample_meta = {}
 
     min_elapsed_s = float(min_elapsed_hours) * 3600.0
     step_s = max(float(step_hours) * 3600.0, 60.0)
+    min_anchor_gap_s = max(float(min_anchor_gap_minutes) * 60.0, 0.0)
 
     for sid, tpl in sequences.items():
         if sid not in mortality_labels or sid not in los_labels:
@@ -140,16 +217,18 @@ def build_event_driven_samples(
             elapsed_s = np.cumsum(
                 np.nan_to_num(tau, nan=60.0, posinf=3600.0, neginf=1.0).astype(np.float64)
             )
-        cutpoints = []
-        next_thr = min_elapsed_s
-        for i in idxs:
-            if elapsed_s[i] >= next_thr:
-                cutpoints.append(int(i))
-                next_thr += step_s
-        if idxs[-1] not in cutpoints:
-            cutpoints.append(int(idxs[-1]))
+        cutpoints = _select_cutpoints(
+            idxs,
+            elapsed_s,
+            anchor_mode=anchor_mode,
+            min_elapsed_s=min_elapsed_s,
+            step_s=step_s,
+            min_anchor_gap_s=min_anchor_gap_s,
+        )
+        if not cutpoints:
+            continue
 
-        if len(cutpoints) > max_samples_per_stay:
+        if max_samples_per_stay > 0 and len(cutpoints) > max_samples_per_stay:
             keep = np.linspace(0, len(cutpoints) - 1, max_samples_per_stay).round().astype(int)
             cutpoints = [cutpoints[k] for k in keep]
 
@@ -166,6 +245,7 @@ def build_event_driven_samples(
             sample_id = f"{sid}::t{j:03d}"
             s, t, m = _window_and_pad(seq, tau, mask, cut_idx, obs_window_hours)
             out_seq[sample_id] = (s, t, m)
+            anchor_elapsed_hours = float(elapsed_s[cut_idx] / 3600.0)
             elapsed_days = float(elapsed_s[cut_idx] / 86400.0)
 
             if horizon_days is not None:
@@ -184,6 +264,9 @@ def build_event_driven_samples(
                 out_l_total[sample_id] = los_total_days
                 out_l_rem[sample_id] = rem_los
             sample_to_stay[sample_id] = sid
+            if stay_subjects is not None and sid in stay_subjects:
+                sample_to_subject[sample_id] = stay_subjects[sid]
+            sample_meta[sample_id] = _window_meta(t, m, anchor_elapsed_hours)
             if static_features is not None and sid in static_features:
                 out_static[sample_id] = static_features[sid]
 
@@ -194,4 +277,6 @@ def build_event_driven_samples(
         "los_remaining_labels": out_l_rem if out_l_rem else None,
         "static_features": out_static if static_features is not None else None,
         "sample_to_stay": sample_to_stay,
+        "sample_to_subject": sample_to_subject if sample_to_subject else None,
+        "sample_metadata": sample_meta,
     }

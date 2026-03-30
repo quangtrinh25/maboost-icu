@@ -189,8 +189,9 @@ def make_loaders(
     static_features = None,
     los_remaining_labels = None,
     batch_size: int = 64,
-    num_workers: int = 4,
+    num_workers: int = 0,
     oversample_pos: bool = False,
+    shuffle_train: bool = True,
     device: str = "cpu",
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
@@ -230,7 +231,7 @@ def make_loaders(
         )
     else:
         tr = DataLoader(
-            train_ds, shuffle=True, batch_size=batch_size,
+            train_ds, shuffle=shuffle_train, batch_size=batch_size,
             num_workers=num_workers, pin_memory=pin,
         )
 

@@ -31,11 +31,13 @@ model:
   topk:     5
   dropout:  0.1
   ref_points: 32
+  event_token_mode: true
+  event_max_tokens: 96
 
 stage1:
   epochs:        120
   lr:            0.0005
-  batch_size:    16
+  batch_size:    8
   patience:      15
   clip_norm:     1.0
   device:        cuda
@@ -44,8 +46,11 @@ stage1:
   focal_gamma:   2.0
   loss_weight:   0.5
   use_mixup:     true
+  use_mixup_horizon: true
   use_mixup_expanding: false
   mixup_alpha:   0.4
+  oversample_pos: false
+  selection_metric: auroc
   aux_weight:    0.05
   aux_held_rate: 0.20
   remaining_los_weight: 0.30
@@ -64,10 +69,11 @@ stage2:
   device:            cuda
 
   use_optuna:         true
-  n_optuna_trials:    10
+  n_optuna_trials:    5
   optuna_depth_max:   5
-  optuna_n_max:       500
+  optuna_n_max:       300
   use_dart:           false
+  mortality_opt_metric: auroc
 
   use_calibration:    true
   use_isotonic:       true
@@ -89,6 +95,7 @@ seed:         42
 online:
   event_file: /home/milis/maboost/results/online_events.jsonl
   history_len: 64
+  obs_window_hours: 4.0
   thresh_mild: 0.05
   thresh_severe: 0.10
   update_flush_every: 32
@@ -96,6 +103,7 @@ online:
 
 research:
   use_longitudinal_samples: true
+  anchor_mode: event
   use_horizon_labels: true
   use_observation_window: true
   obs_window_hours: 4.0
@@ -103,6 +111,7 @@ research:
   los_target: remaining
   enable_remaining_head: true
   group_aware_split: true
-  min_elapsed_hours: 4.0
+  min_elapsed_hours: 0.0
   step_hours: 4.0
+  min_anchor_gap_minutes: 0.0
   max_samples_per_stay: 8

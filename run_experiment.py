@@ -29,6 +29,7 @@ Fixes vs previous version
 """
 from __future__ import annotations
 import argparse, pickle
+import gc
 import json
 import time
 from pathlib import Path
@@ -75,6 +76,51 @@ def _train_eval_xgb_heads(
         "auprc": float(average_precision_score(ym_te, yp_m)),
         "los_mae": float(mean_absolute_error(yl_te, yp_l)),
         "los_rmse": float(np.sqrt(((yl_te - yp_l) ** 2).mean())),
+    }
+
+
+def _count_nn_params(module: torch.nn.Module) -> dict:
+    total = int(sum(p.numel() for p in module.parameters()))
+    trainable = int(sum(p.numel() for p in module.parameters() if p.requires_grad))
+    return {"total": total, "trainable": trainable}
+
+
+def _count_tree_nodes(node) -> tuple[int, int]:
+    if isinstance(node, dict):
+        if "leaf" in node:
+            return 1, 1
+        children = node.get("children", [])
+        nodes = 1
+        leaves = 0
+        for child in children:
+            c_nodes, c_leaves = _count_tree_nodes(child)
+            nodes += c_nodes
+            leaves += c_leaves
+        return nodes, leaves
+    if isinstance(node, list):
+        nodes = 0
+        leaves = 0
+        for child in node:
+            c_nodes, c_leaves = _count_tree_nodes(child)
+            nodes += c_nodes
+            leaves += c_leaves
+        return nodes, leaves
+    return 0, 0
+
+
+def _xgb_complexity(booster) -> dict:
+    trees = booster.get_dump(dump_format="json")
+    node_count = 0
+    leaf_count = 0
+    for tree in trees:
+        root = json.loads(tree)
+        nodes, leaves = _count_tree_nodes(root)
+        node_count += nodes
+        leaf_count += leaves
+    return {
+        "trees": len(trees),
+        "nodes": int(node_count),
+        "leaves": int(leaf_count),
     }
 
 
@@ -135,7 +181,14 @@ def _online_loop(cfg: dict, event_file: str, poll_seconds: float = 0.25) -> None
     m = cfg["model"]
     s1 = cfg["stage1"]
     online_cfg = cfg.get("online", {})
+    research_cfg = cfg.get("research", {})
     history_len = int(online_cfg.get("history_len", cfg["data"].get("seq_len", 128)))
+    obs_window_hours = float(
+        online_cfg.get(
+            "obs_window_hours",
+            research_cfg.get("obs_window_hours", 4.0),
+        )
+    )
     thresh_mild = float(online_cfg.get("thresh_mild", 0.05))
     thresh_severe = float(online_cfg.get("thresh_severe", 0.10))
     flush_every = int(online_cfg.get("update_flush_every", 32))
@@ -147,8 +200,13 @@ def _online_loop(cfg: dict, event_file: str, poll_seconds: float = 0.25) -> None
         dropout=m["dropout"],
         topk=m.get("topk", 5),
     )
-    if "ref_points" in m:
-        enc_kw["ref_points"] = m["ref_points"]
+    for key in ("ref_points", "event_token_mode", "event_max_tokens"):
+        if key in m:
+            enc_kw[key] = m[key]
+    if research_cfg.get("use_observation_window", False):
+        enc_kw["window_hours"] = float(research_cfg.get("obs_window_hours", 4.0))
+    else:
+        enc_kw["window_hours"] = float(cfg["data"].get("window_hours", 48.0))
 
     pipe = MaBoostOnlinePipeline.load(
         ckpt_dir=ckpt_dir,
@@ -158,6 +216,7 @@ def _online_loop(cfg: dict, event_file: str, poll_seconds: float = 0.25) -> None
         **enc_kw,
     )
     pipe.history_len = history_len
+    pipe.obs_window_hours = obs_window_hours
     pipe.thresh_mild = thresh_mild
     pipe.thresh_severe = thresh_severe
 
@@ -245,6 +304,8 @@ def main():
                     help="Skip deep learning baselines (GRU-D, LSTM, etc.)")
     pa.add_argument("--skip-new-tests", action="store_true",
                     help="Skip early/sparse/rolling prediction tests")
+    pa.add_argument("--fair-judge-only", action="store_true",
+                    help="Reuse saved checkpoints and run only the exact event-replay fair benchmark")
     pa.add_argument("--mode", choices=["offline", "online_service"], default="offline")
     pa.add_argument("--event-file", default=None,
                     help="Path to JSONL stream file for --mode online_service")
@@ -299,10 +360,17 @@ def main():
             save_dir  = cfg["data"]["processed"],
         )
 
-    seqs, static  = etl["sequences"], etl["static_features"]
-    y_mort, y_los = etl["mortality_labels"], etl["los_labels"]
     stay_outcomes = etl.get("stay_outcomes", {})
+    stay_subjects = etl.get("stay_subjects", {})
+
+    seqs = etl["sequences"]
+    static = etl["static_features"]
+    y_mort = etl["mortality_labels"]
+    y_los = etl["los_labels"]
     y_los_rem = None
+    sample_meta = None
+    sample_to_subject = None
+    prefix_cache_path = None
     ts_names      = etl["feature_names"]   # 40 time-series feature names
     st_names      = etl["static_names"]    # 42 static feature names
     d_input       = len(ts_names)
@@ -316,8 +384,11 @@ def main():
             los_labels=y_los,
             stay_outcomes=stay_outcomes,
             static_features=static,
+            stay_subjects=stay_subjects,
+            anchor_mode=str(research_cfg.get("anchor_mode", "step")),
             min_elapsed_hours=float(research_cfg.get("min_elapsed_hours", 6.0)),
             step_hours=float(research_cfg.get("step_hours", 6.0)),
+            min_anchor_gap_minutes=float(research_cfg.get("min_anchor_gap_minutes", 0.0)),
             max_samples_per_stay=int(research_cfg.get("max_samples_per_stay", 64)),
             obs_window_hours=(
                 float(research_cfg["obs_window_hours"])
@@ -337,9 +408,18 @@ def main():
         y_los = temporal["los_labels"]
         y_los_rem = temporal["los_remaining_labels"]
         sample_to_stay = temporal["sample_to_stay"]
+        sample_to_subject = temporal.get("sample_to_subject")
+        sample_meta = temporal.get("sample_metadata")
+        # Keep only the expanded event samples during training. The original
+        # stay-level ETL remains on disk and can be reloaded later for the
+        # fixed48 prefix benchmark, which avoids carrying both copies in RAM.
+        prefix_cache_path = str(etl_cache)
+        del temporal, etl
+        gc.collect()
         print(
-            f"[Research] Longitudinal samples: {len(seqs):,} "
+            f"[Research] Event samples: {len(seqs):,} "
             f"from {len(set(sample_to_stay.values())):,} stays | "
+            f"anchor={research_cfg.get('anchor_mode', 'step')} | "
             f"obs_window={research_cfg.get('obs_window_hours', 'prefix')}h | "
             f"mort_h={research_cfg.get('mortality_horizon_hours', 'final')}h | "
             f"los={research_cfg.get('los_target', 'remaining')}"
@@ -371,19 +451,34 @@ def main():
     labels  = [y_mort[s] for s in all_ids]
     tr_f    = cfg["data"]["train_frac"]
     va_f    = cfg["data"]["val_frac"]
-    if sample_to_stay is not None and research_cfg.get("group_aware_split", True):
-        groups = np.array([sample_to_stay[s] for s in all_ids])
+    split_groups = None
+    split_level = None
+    if sample_to_subject is not None:
+        split_groups = np.array([sample_to_subject[s] for s in all_ids])
+        split_level = "subject"
+    elif sample_to_stay is not None:
+        split_groups = np.array([sample_to_stay[s] for s in all_ids])
+        split_level = "stay"
+
+    if split_groups is not None and research_cfg.get("group_aware_split", True):
+        groups = split_groups
         gss1 = GroupShuffleSplit(n_splits=1, train_size=tr_f, random_state=cfg["seed"])
         tr_idx, tmp_idx = next(gss1.split(all_ids, labels, groups=groups))
         tr_ids = [all_ids[i] for i in tr_idx]
         tmp_ids = [all_ids[i] for i in tmp_idx]
-        tmp_groups = np.array([sample_to_stay[s] for s in tmp_ids])
+        if sample_to_subject is not None:
+            tmp_groups = np.array([sample_to_subject[s] for s in tmp_ids])
+        else:
+            tmp_groups = np.array([sample_to_stay[s] for s in tmp_ids])
         te_frac = (1 - tr_f - va_f) / (1 - tr_f)
         gss2 = GroupShuffleSplit(n_splits=1, test_size=te_frac, random_state=cfg["seed"])
         va_i, te_i = next(gss2.split(tmp_ids, [y_mort[s] for s in tmp_ids], groups=tmp_groups))
         va_ids = [tmp_ids[i] for i in va_i]
         te_ids = [tmp_ids[i] for i in te_i]
-        print("[Research] Group-aware split enabled (no patient leakage across splits).")
+        if split_level == "subject":
+            print("[Research] Group-aware split enabled at subject level (no patient leakage across splits).")
+        else:
+            print("[Research] Group-aware split enabled at stay level (multiple stays from one subject may still share a split).")
     else:
         tr_ids, tmp, _, tmp_l = train_test_split(
             all_ids, labels,
@@ -405,12 +500,97 @@ def main():
         with open(splits_dir / f"{name}_ids.pkl", "wb") as f:
             pickle.dump(ids, f)
 
+    if sample_to_stay is not None:
+        prefix_tr_ids = sorted(set(sample_to_stay[s] for s in tr_ids))
+        prefix_va_ids = sorted(set(sample_to_stay[s] for s in va_ids))
+        prefix_te_ids = sorted(set(sample_to_stay[s] for s in te_ids))
+    else:
+        prefix_tr_ids = list(tr_ids)
+        prefix_va_ids = list(va_ids)
+        prefix_te_ids = list(te_ids)
+
+    if args.fair_judge_only:
+        m = cfg["model"]
+        enc_kw = dict(
+            d_state=m["d_state"],
+            n_layers=m.get("n_layers", 3),
+            n_heads=m["n_heads"],
+            dropout=m["dropout"],
+            topk=m.get("topk", 5),
+        )
+        for key in ("ref_points", "event_token_mode", "event_max_tokens"):
+            if key in m:
+                enc_kw[key] = m[key]
+        if research_cfg.get("use_observation_window", False):
+            enc_kw["window_hours"] = float(research_cfg.get("obs_window_hours", 4.0))
+        else:
+            enc_kw["window_hours"] = float(cfg["data"].get("window_hours", 48.0))
+
+        ckpt_path = Path(cfg["ckpt_dir"]) / "encoder_best.pth"
+        mort_path = Path(cfg["ckpt_dir"]) / "xgb_mortality.ubj"
+        los_path = Path(cfg["ckpt_dir"]) / "xgb_los.ubj"
+        missing = [str(p) for p in (ckpt_path, mort_path, los_path) if not p.exists()]
+        if missing:
+            raise FileNotFoundError(
+                "Fair judge only needs existing checkpoints, but these files are missing: "
+                + ", ".join(missing)
+            )
+
+        if sample_to_stay is not None and prefix_cache_path is not None:
+            prefix_etl = load_etl_output(prefix_cache_path)
+            prefix_sequences = prefix_etl["sequences"]
+            prefix_static_features = prefix_etl["static_features"]
+        else:
+            prefix_sequences = seqs
+            prefix_static_features = static
+
+        bench = OfflineBenchmark(
+            sequences        = seqs,
+            mortality_labels = y_mort,
+            los_labels       = y_los,
+            train_ids        = tr_ids,
+            val_ids          = va_ids,
+            test_ids         = te_ids,
+            d_input          = d_input,
+            d_model          = cfg["model"]["d_model"],
+            static_features  = static,
+            encoder_path     = str(ckpt_path),
+            mort_path        = str(mort_path),
+            los_path         = str(los_path),
+            device           = cfg["stage1"]["device"],
+            enc_kw           = enc_kw,
+            sample_to_stay   = sample_to_stay,
+            prefix_sequences = prefix_sequences,
+            prefix_static_features = prefix_static_features,
+            prefix_stay_outcomes = stay_outcomes,
+            sample_metadata = sample_meta,
+            prefix_train_ids = prefix_tr_ids,
+            prefix_val_ids = prefix_va_ids,
+            prefix_test_ids = prefix_te_ids,
+            prefix_obs_window_hours = float(research_cfg.get("obs_window_hours", 4.0)),
+            prefix_mortality_horizon_hours = float(research_cfg.get("mortality_horizon_hours", 24.0)),
+            prefix_los_target = str(research_cfg.get("los_target", "remaining")),
+        )
+        print("[Benchmark] Fair judge only: reusing saved checkpoints, no Stage 1/2 retraining.")
+        bench_results = bench.run_all(skip=[
+            "MaBoost (ours)", "XGBoost-flat",
+            "fixed48_prefix", "event_progression", "event_horizons",
+            "early_prediction", "sparse_vs_dense", "rolling_prediction", "irregular_gaps",
+        ])
+        bench.print_table(bench_results)
+        bench.save_csv(bench_results, f"{cfg['results_dir']}/benchmark_temporal.csv")
+        return
+
     s1 = cfg["stage1"]
+    is_horizon_task = bool(research_cfg.get("use_horizon_labels", False))
+    oversample_pos = bool(s1.get("oversample_pos", is_horizon_task))
     tr_loader, va_loader, te_loader = make_loaders(
         seqs, y_mort, y_los, tr_ids, va_ids, te_ids,
         static_features=static,
         los_remaining_labels=y_los_rem,
         batch_size=s1["batch_size"],
+        oversample_pos=oversample_pos,
+        device=s1.get("device", "cpu"),
     )
 
     # ── 3. Stage 1 — train Mamba encoder ────────────────────────────────
@@ -422,8 +602,13 @@ def main():
         dropout   = m["dropout"],
         topk      = m.get("topk", 5),
     )
-    if "ref_points" in m:
-        enc_kw["ref_points"] = m["ref_points"]
+    for key in ("ref_points", "event_token_mode", "event_max_tokens"):
+        if key in m:
+            enc_kw[key] = m[key]
+    if research_cfg.get("use_observation_window", False):
+        enc_kw["window_hours"] = float(research_cfg.get("obs_window_hours", 4.0))
+    else:
+        enc_kw["window_hours"] = float(cfg["data"].get("window_hours", 48.0))
     # FIX 6: d_static computed here; used later for n_static_dims in train_stage2
     d_static = next(iter(static.values())).shape[0] if static else 0
     model    = DualHeadMamba(
@@ -432,8 +617,22 @@ def main():
         enable_remaining_head=bool(y_los_rem is not None and research_cfg.get("enable_remaining_head", True)),
         **enc_kw,
     )
+    param_report = {
+        "dual_head_mamba": _count_nn_params(model),
+        "encoder_only": _count_nn_params(model.encoder),
+    }
+    print(
+        "[Model] DualHeadMamba params="
+        f"{param_report['dual_head_mamba']['total']:,} total "
+        f"({param_report['dual_head_mamba']['trainable']:,} trainable) | "
+        f"encoder={param_report['encoder_only']['total']:,}"
+    )
     use_mixup = bool(s1.get("use_mixup", True))
-    if y_los_rem is not None:
+    if is_horizon_task:
+        # Rare-event horizon labels are sensitive to label smoothing from mixup.
+        # Default to off unless explicitly re-enabled for this regime.
+        use_mixup = bool(s1.get("use_mixup_horizon", False))
+    elif y_los_rem is not None:
         # In longitudinal / early-sample mode, mixup blurs temporal supervision
         # and disables the remaining-LOS loss path in the current trainer.
         # Disable it whenever per-cutpoint remaining-LOS labels are present,
@@ -453,11 +652,13 @@ def main():
         loss_weight = s1.get("loss_weight", 0.5),
         use_mixup   = use_mixup,
         mixup_alpha = s1.get("mixup_alpha", 0.4),
+        oversample_pos = oversample_pos,
         aux_weight = s1.get("aux_weight",    0.1),
         aux_held_rate = s1.get("aux_held_rate", 0.2),
         remaining_los_weight = s1.get("remaining_los_weight", 0.3),
         trend_stop_window = s1.get("trend_stop_window", 8),
         trend_stop_delta  = s1.get("trend_stop_delta", 0.01),
+        selection_metric = s1.get("selection_metric", "auprc" if is_horizon_task else "auroc"),
     )
 
     # ── 4. Stage 2 — freeze + dual XGBoost ──────────────────────────────
@@ -499,6 +700,7 @@ def main():
         optuna_depth_max     = s2.get("optuna_depth_max",      10),
         optuna_n_max         = s2.get("optuna_n_max",          2000),
         use_dart             = s2.get("use_dart",              False),
+        mortality_opt_metric = s2.get("mortality_opt_metric",  "auprc" if is_horizon_task else "auroc"),
         use_calibration      = s2.get("use_calibration",       True),
         use_isotonic         = s2.get("use_isotonic",          True),
         drop_low_importance  = s2.get("drop_low_importance",   True),
@@ -513,6 +715,18 @@ def main():
         n_zmulti_dims            = 4 * d_model,   # 4 * d_model from cfg["model"]["d_model"]
         n_static_dims            = d_static,       # computed above from static features
     )
+    param_report["xgb_mortality"] = _xgb_complexity(xgb_mort.booster)
+    param_report["xgb_los"] = _xgb_complexity(xgb_los.booster)
+    param_report_path = Path(cfg["results_dir"]) / "model_params.json"
+    param_report_path.write_text(json.dumps(param_report, indent=2), encoding="utf-8")
+    print(
+        "[Model] XGB complexity | "
+        f"mort_trees={param_report['xgb_mortality']['trees']} "
+        f"mort_nodes={param_report['xgb_mortality']['nodes']} | "
+        f"los_trees={param_report['xgb_los']['trees']} "
+        f"los_nodes={param_report['xgb_los']['nodes']}"
+    )
+    print(f"[Model] Param report saved → {param_report_path}")
 
     # ── 5. MaBoost predictions on test set ───────────────────────────────
     # IMPORTANT: use F_te_final (after interaction + cross + filter transforms),
@@ -544,7 +758,7 @@ def main():
     yl_te_flat = np.array([y_los[s] for s in te_ids], dtype=np.float32)
 
     head_rows = []
-    # 1) XGBoost-flat baseline
+    # 1) XGBoost-flat baseline from standalone flat statistics
     head_rows.append({
         "head": "xgboost_flat",
         **_train_eval_xgb_heads(
@@ -570,9 +784,19 @@ def main():
             device=s2["device"],
         ),
     })
-    # 4) Hybrid head = your current frozen Mamba + XGBoost stage2
+    # 4) Plain hybrid on raw frozen features: [z_multi | raw_stats | static]
+    # This isolates whether z_multi itself helps before Stage 2 tricks
+    # such as static cross features, interaction features, and filtering.
     head_rows.append({
-        "head": "hybrid_head",
+        "head": "hybrid_plain",
+        **_train_eval_xgb_heads(
+            F_tr, ym_tr, yl_tr, F_va, ym_va, yl_va, F_te, ym_te, yl_te,
+            device=s2["device"],
+        ),
+    })
+    # 5) Full hybrid head = current MaBoost Stage 2 with all transforms
+    head_rows.append({
+        "head": "hybrid_full",
         "auroc": float(roc_auc_score(ym_te, y_prob_mort)),
         "auprc": float(average_precision_score(ym_te, y_prob_mort)),
         "los_mae": float(mean_absolute_error(yl_te, y_pred_los)),
@@ -583,6 +807,13 @@ def main():
 
     # ── 6. Offline benchmark ─────────────────────────────────────────────
     # FIX 2 — enc_kw forwarded so eval_maboost() loads correct architecture
+    if sample_to_stay is not None and prefix_cache_path is not None:
+        prefix_etl = load_etl_output(prefix_cache_path)
+        prefix_sequences = prefix_etl["sequences"]
+        prefix_static_features = prefix_etl["static_features"]
+    else:
+        prefix_sequences = seqs
+        prefix_static_features = static
     bench = OfflineBenchmark(
         sequences        = seqs,
         mortality_labels = y_mort,
@@ -598,6 +829,17 @@ def main():
         los_path         = str(Path(cfg["ckpt_dir"]) / "xgb_los.ubj"),
         device           = s1["device"],
         enc_kw           = enc_kw,   # FIX 2
+        sample_to_stay   = sample_to_stay,
+        prefix_sequences = prefix_sequences,
+        prefix_static_features = prefix_static_features,
+        prefix_stay_outcomes = stay_outcomes,
+        sample_metadata = sample_meta,
+        prefix_train_ids = prefix_tr_ids,
+        prefix_val_ids = prefix_va_ids,
+        prefix_test_ids = prefix_te_ids,
+        prefix_obs_window_hours = float(research_cfg.get("obs_window_hours", 4.0)),
+        prefix_mortality_horizon_hours = float(research_cfg.get("mortality_horizon_hours", 24.0)),
+        prefix_los_target = str(research_cfg.get("los_target", "remaining")),
     )
 
     skip_list = ["MaBoost (ours)"]
@@ -607,10 +849,16 @@ def main():
             "GRU-D (cell)", "SAnD", "STraTS", "InterpNet", "TCN",
         ]
     if args.skip_new_tests:
-        skip_list += ["early_prediction", "sparse_vs_dense", "rolling_prediction"]
+        skip_list += ["event_replay", "fixed48_prefix", "event_progression", "event_horizons", "early_prediction", "sparse_vs_dense", "rolling_prediction", "irregular_gaps"]
     if sample_to_stay is not None and research_cfg.get("use_observation_window", False):
-        skip_list += ["early_prediction", "sparse_vs_dense", "rolling_prediction", "irregular_gaps"]
-        print("[Benchmark] Skipping legacy temporal subgroup tests in early-sample mode.")
+        # In early-sample mode each sample is already a trailing observation window,
+        # so legacy hour-cut tests are no longer meaningful. Keep the true
+        # irregularity comparisons (fixed48 prefix, event progression, sparse/dense and gap-variance).
+        skip_list += ["early_prediction", "rolling_prediction"]
+        print(
+            "[Benchmark] Early-sample mode: skipping legacy hour-cut tests; "
+            "keeping event replay, fixed48 prefix, event progression, event horizons, sparse/dense and gap-variance irregular benchmarks."
+        )
 
     # FIX 3 — baselines wrapped in try/except inside run_all()
     bench_results = bench.run_all(skip=skip_list)
@@ -622,14 +870,30 @@ def main():
         los_mae  = float(mean_absolute_error(yl_te, y_pred_los)),
         los_rmse = float(np.sqrt(((yl_te - y_pred_los) ** 2).mean())),
     )
+    component_results = [
+        BenchResult(
+            name={
+                "encoder_head": "Mamba-z-only",
+                "flat_head": "Flat-head",
+                "hybrid_plain": "Hybrid-plain",
+            }[r["head"]],
+            auroc=float(r["auroc"]),
+            auprc=float(r["auprc"]),
+            los_mae=float(r["los_mae"]),
+            los_rmse=float(r["los_rmse"]),
+            extra={"table": "full"},
+        )
+        for r in head_rows
+        if r["head"] in {"encoder_head", "flat_head", "hybrid_plain"}
+    ]
 
-    full_results = [maboost_result] + [
+    full_results = [maboost_result] + component_results + [
         r for r in bench_results
         if r.extra.get("table", "full") == "full"
     ]
     new_test_results = [
         r for r in bench_results
-        if r.extra.get("test") in ("early", "sparse_dense", "rolling", "gap_variance")
+        if r.extra.get("test") in ("event_replay", "prefix_fixed48", "event_progression", "event_horizon", "early", "sparse_dense", "rolling", "gap_variance")
     ]
 
     bench.print_table(full_results)
@@ -642,6 +906,13 @@ def main():
         )
         print(f"[Benchmark] Temporal results saved → "
               f"{cfg['results_dir']}/benchmark_temporal_irregular.csv")
+    else:
+        irr_path = Path(cfg["results_dir"]) / "benchmark_temporal_irregular.csv"
+        irr_path.write_text(
+            "model,auroc,auprc,los_mae,los_rmse,train_s,table,test,hours,group,n,n_ts_avg,avg_gap_std_s\n",
+            encoding="utf-8",
+        )
+        print("[Benchmark] No irregular-table rows for this run; cleared stale temporal CSV.")
 
     # ── 7. Visualization ─────────────────────────────────────────────────
     save_all(
