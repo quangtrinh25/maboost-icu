@@ -403,12 +403,19 @@ class DualHeadMamba(nn.Module):
         self.encoder    = MambaEncoder(d_input, d_model, **enc_kw)
         drop            = enc_kw.get("dropout", 0.1)
         self.has_static = d_static > 0
+        self.d_static   = int(d_static)
         self.enable_remaining_head = bool(enable_remaining_head)
-        if self.has_static:
-            self.static_emb = nn.Sequential(
-                nn.Linear(d_static, d_model), nn.ReLU(),
-                nn.Dropout(drop), nn.Linear(d_model, d_model),
-            )
+        self.seq_feat_dim = 4 * d_model + 5 * d_input
+        self.head_in_dim = self.seq_feat_dim + self.d_static
+        self.feature_backbone = nn.Sequential(
+            nn.LayerNorm(self.head_in_dim),
+            nn.Linear(self.head_in_dim, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(drop),
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(drop),
+        )
         self.mort_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2), nn.GELU(),
             nn.Dropout(drop), nn.Linear(d_model // 2, 2),
@@ -423,14 +430,35 @@ class DualHeadMamba(nn.Module):
                 nn.Dropout(drop), nn.Linear(d_model // 2, 1),
             )
 
+    def _assemble_stage2_like_features(
+        self,
+        x: torch.Tensor,
+        tau: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        x_static: Optional[torch.Tensor] = None,
+        t_abs: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        z_multi, raw_stats = self.encoder.extract_features(x, tau, mask, t_abs)
+        parts = [
+            z_multi,
+            torch.nan_to_num(raw_stats, nan=0.0, posinf=0.0, neginf=0.0),
+        ]
+        if self.has_static:
+            if x_static is None:
+                x_static = z_multi.new_zeros((z_multi.shape[0], self.d_static))
+            else:
+                x_static = torch.nan_to_num(x_static, nan=0.0, posinf=0.0, neginf=0.0)
+            parts.append(x_static)
+        return torch.cat(parts, dim=-1)
+
     def forward(self, x: torch.Tensor, tau: torch.Tensor,
                 mask: Optional[torch.Tensor] = None,
                 x_static: Optional[torch.Tensor] = None,
                 t_abs: Optional[torch.Tensor] = None,
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
-        z = self.encoder(x, tau, mask, t_abs)
-        if self.has_static and x_static is not None:
-            z = z + self.static_emb(torch.nan_to_num(x_static, nan=0.0))
+        z = self.feature_backbone(
+            self._assemble_stage2_like_features(x, tau, mask, x_static, t_abs)
+        )
         return self.mort_head(z), self.los_head(z).squeeze(-1)
 
     def forward_research(self, x: torch.Tensor, tau: torch.Tensor,
@@ -438,9 +466,9 @@ class DualHeadMamba(nn.Module):
                          x_static: Optional[torch.Tensor] = None,
                          t_abs: Optional[torch.Tensor] = None,
                          ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        z = self.encoder(x, tau, mask, t_abs)
-        if self.has_static and x_static is not None:
-            z = z + self.static_emb(torch.nan_to_num(x_static, nan=0.0))
+        z = self.feature_backbone(
+            self._assemble_stage2_like_features(x, tau, mask, x_static, t_abs)
+        )
         mort = self.mort_head(z)
         los_total = self.los_head(z).squeeze(-1)
         los_rem = self.rem_los_head(z).squeeze(-1) if self.enable_remaining_head else None

@@ -19,6 +19,7 @@ shap/los_clinical.png
 shap/latent_umap.png
 """
 from __future__ import annotations
+import pickle
 from pathlib import Path
 from typing import List, Optional
 
@@ -194,13 +195,239 @@ def _plot_umap(z_T, y_prob, y_true, path):
     _save(fig, path)
 
 
-def build_feature_names(ts_names, st_names, d_model, keep_idx=None):
+def _stage2_full_feature_names(
+    base_names: List[str],
+    ckpt_dir: Optional[str],
+) -> List[str]:
+    if not ckpt_dir:
+        return list(base_names)
+
+    meta_path = Path(ckpt_dir) / "stage2_meta.pkl"
+    if not meta_path.exists():
+        return list(base_names)
+
+    with meta_path.open("rb") as f:
+        meta = pickle.load(f)
+
+    names = list(base_names)
+
+    if meta.get("use_static_cross", False):
+        n_zmulti = int(meta.get("n_zmulti_dims", 0))
+        n_static = int(meta.get("n_static_dims", 0))
+        top_z = min(int(meta.get("static_cross_top_z", 16)), max(n_zmulti, 0))
+        bin_idx = list(meta.get("static_cross_bin_idx", []))
+        static_start = len(names) - n_static
+        cross_names = []
+        if n_zmulti > 0 and n_static > 0 and static_start >= 0:
+            for si in bin_idx:
+                if si < 0 or (static_start + si) >= len(names):
+                    continue
+                s_name = names[static_start + si]
+                for zi in range(top_z):
+                    if zi >= len(names):
+                        break
+                    z_name = names[zi]
+                    cross_names.append(f"cross__{s_name}__x__{z_name}")
+        names.extend(cross_names)
+
+    if meta.get("use_interaction_features", False):
+        pair_names = []
+        for i, j in meta.get("interaction_pairs", []):
+            if 0 <= i < len(names) and 0 <= j < len(names):
+                pair_names.append(f"int__{names[i]}__x__{names[j]}")
+            else:
+                pair_names.append(f"int__f{i}__x__f{j}")
+        names = pair_names + names
+
+    return names
+
+
+_CLINICAL_DISPLAY: dict = {
+    # ── Vital signs ─────────────────────────────────────────────────────────
+    "heart_rate":       "Heart Rate (bpm)",
+    "sbp":              "Systolic BP (mmHg)",
+    "dbp":              "Diastolic BP (mmHg)",
+    "map":              "Mean Arterial Pressure",
+    "spo2":             "SpO2 (%)",
+    "resp_rate":        "Respiratory Rate",
+    "temp_c":           "Temperature (°C)",
+    "temp_f":           "Temperature (°F)",
+    "gcs_total":        "GCS Total",
+    "gcs_verbal":       "GCS Verbal",
+    "gcs_motor":        "GCS Motor",
+    "gcs_eye":          "GCS Eye",
+    "glucose":          "Glucose",
+    "fio2":             "FiO2 (%)",
+    "urine_output":     "Urine Output (mL)",
+    # ── Labs ────────────────────────────────────────────────────────────────
+    "lactate":          "Lactate",
+    "bicarbonate":      "Bicarbonate",
+    "ph":               "pH (arterial)",
+    "pao2":             "PaO2",
+    "paco2":            "PaCO2",
+    "creatinine":       "Creatinine",
+    "bun":              "BUN",
+    "sodium":           "Sodium",
+    "potassium":        "Potassium",
+    "chloride":         "Chloride",
+    "calcium":          "Calcium",
+    "magnesium":        "Magnesium",
+    "phosphate":        "Phosphate",
+    "hemoglobin":       "Hemoglobin",
+    "hematocrit":       "Hematocrit",
+    "wbc":              "WBC",
+    "platelet":         "Platelet Count",
+    "bilirubin_total":  "Total Bilirubin",
+    "alt":              "ALT",
+    "ast":              "AST",
+    "inr":              "INR",
+    "pt":               "PT",
+    "ptt":              "PTT",
+    "crp":              "CRP",
+    "procalcitonin":    "Procalcitonin",
+    # ── Static / Demographics ───────────────────────────────────────────────
+    "age":                      "Age (years)",
+    "gender_male":              "Male gender",
+    "emergency_admit":          "Emergency admission",
+    "elective_admit":           "Elective admission",
+    "insurance_medicare":       "Medicare insurance",
+    "insurance_medicaid":       "Medicaid insurance",
+    "insurance_private":        "Private insurance",
+    "micu":                     "Medical ICU",
+    "sicu":                     "Surgical ICU",
+    "cicu":                     "Cardiac ICU",
+    "nicu":                     "Neuro ICU",
+    "csru":                     "Cardiac Surgery Recovery",
+    # ── Elixhauser comorbidities ───────────────────────────────────────────
+    "chf":                      "Congestive Heart Failure",
+    "cardiac_arrhythmia":       "Cardiac Arrhythmia",
+    "valvular_disease":         "Valvular Disease",
+    "pulmonary_circulation":    "Pulmonary Circulation Disorder",
+    "pvd":                      "Peripheral Vascular Disease",
+    "hypertension":             "Hypertension",
+    "paralysis":                "Paralysis",
+    "other_neurological":       "Other Neurological Disorder",
+    "copd":                     "COPD",
+    "diabetes_uncomplicated":   "Diabetes (uncomplicated)",
+    "diabetes_complicated":     "Diabetes (complicated)",
+    "hypothyroidism":           "Hypothyroidism",
+    "renal_failure":            "Renal Failure",
+    "liver_disease":            "Liver Disease",
+    "peptic_ulcer":             "Peptic Ulcer Disease",
+    "aids":                     "AIDS/HIV",
+    "lymphoma":                 "Lymphoma",
+    "metastatic_cancer":        "Metastatic Cancer",
+    "solid_tumor":              "Solid Tumor",
+    "rheumatoid_arthritis":     "Rheumatoid Arthritis",
+    "coagulopathy":             "Coagulopathy",
+    "obesity":                  "Obesity",
+    "weight_loss":              "Weight Loss",
+    "fluid_electrolyte":        "Fluid/Electrolyte Disorder",
+    "blood_loss_anemia":        "Blood Loss Anemia",
+    "deficiency_anemia":        "Deficiency Anemia",
+    "alcohol_abuse":            "Alcohol Abuse",
+    "drug_abuse":               "Drug Abuse",
+    "psychoses":                "Psychoses",
+    "depression":               "Depression",
+}
+
+_STAT_SUFFIX_DISPLAY: dict = {
+    "last_":  " (last obs)",
+    "mean_":  " (stay mean)",
+    "max_":   " (stay max)",
+    "std_":   " (variability)",
+    "miss_":  " missing rate",
+}
+
+
+def hospital_feature_names(raw_names: list) -> list:
     """
-    Build human-readable feature names for XGBoost input vector.
-    If keep_idx provided, returns only kept features (mortality booster).
-    For LOS booster (no keep_idx), returns all 754 names.
+    Convert internal feature names to human-readable hospital display names.
+
+    Mapping:
+        last_heart_rate   → "Heart Rate (bpm) (last obs)"
+        mean_lactate      → "Lactate (stay mean)"
+        miss_creatinine   → "Creatinine missing rate"
+        age               → "Age (years)"
+        chf               → "Congestive Heart Failure"
+        z_last_0          → "Mamba Latent·last [dim 0]"
+        z_mean_42         → "Mamba Latent·mean [dim 42]"
+        cross__gender_male__x__z_last_0 → "cross: Male × Mamba-last[0]"
+        int__f0__x__f1    → "interaction: f0 × f1"
+
+    Parameters
+    ----------
+    raw_names : list of str
+        Feature names as produced by build_feature_names().
+
+    Returns
+    -------
+    list of str
+        Human-readable display names, same length as raw_names.
     """
-    names = (
+    out = []
+    for name in raw_names:
+        # ── Mamba latent dims ──────────────────────────────────────────────
+        if name.startswith("z_last_"):
+            out.append(f"Mamba Latent·last [dim {name[7:]}]")
+        elif name.startswith("z_mean_"):
+            out.append(f"Mamba Latent·mean [dim {name[7:]}]")
+        elif name.startswith("z_max_"):
+            out.append(f"Mamba Latent·max [dim {name[6:]}]")
+        elif name.startswith("z_attn_"):
+            out.append(f"Mamba Latent·attn [dim {name[7:]}]")
+        # ── Cross / interaction features ───────────────────────────────────
+        elif name.startswith("cross__"):
+            parts = name[7:].split("__x__")
+            if len(parts) == 2:
+                a = hospital_feature_names([parts[0]])[0]
+                b = hospital_feature_names([parts[1]])[0]
+                out.append(f"Cross: {a} × {b}")
+            else:
+                out.append(name)
+        elif name.startswith("int__"):
+            parts = name[5:].split("__x__")
+            if len(parts) == 2:
+                out.append(f"Interact: {parts[0]} × {parts[1]}")
+            else:
+                out.append(name)
+        else:
+            # ── stat prefix + clinical name ────────────────────────────────
+            matched = False
+            for prefix, suffix in _STAT_SUFFIX_DISPLAY.items():
+                if name.startswith(prefix):
+                    feat_code = name[len(prefix):]
+                    clinical = _CLINICAL_DISPLAY.get(feat_code, feat_code.replace("_", " ").title())
+                    out.append(clinical + suffix)
+                    matched = True
+                    break
+            if not matched:
+                # ── static / demographic ───────────────────────────────────
+                out.append(_CLINICAL_DISPLAY.get(name, name.replace("_", " ").title()))
+    return out
+
+
+def build_feature_names(ts_names, st_names, d_model, keep_idx=None, ckpt_dir=None,
+                        hospital_readable: bool = False):
+    """
+    Build human-readable feature names for the Stage 2 XGBoost input vector.
+
+    If `ckpt_dir` contains `stage2_meta.pkl`, reconstructs the exact transformed
+    feature space used by Stage 2:
+      1. base features [z_multi | raw_stats | static]
+      2. optional static x z_multi cross features (appended)
+      3. optional interaction features (prepended)
+
+    If keep_idx is provided, returns only the kept mortality features from that
+    transformed space. Without ckpt_dir, this falls back to base-feature names.
+
+    Parameters
+    ----------
+    hospital_readable : bool
+        If True, applies hospital_feature_names() to convert internal codes
+        to human-readable clinical display names (e.g. for SHAP plot axes).
+    """
+    base_names = (
         [f"z_last_{i}" for i in range(d_model)] +
         [f"z_mean_{i}" for i in range(d_model)] +
         [f"z_max_{i}"  for i in range(d_model)] +
@@ -212,8 +439,11 @@ def build_feature_names(ts_names, st_names, d_model, keep_idx=None):
         [f"miss_{n}"   for n in ts_names] +
         list(st_names)
     )
+    names = _stage2_full_feature_names(base_names, ckpt_dir=ckpt_dir)
     if keep_idx is not None:
         names = [names[i] for i in keep_idx if i < len(names)]
+    if hospital_readable:
+        names = hospital_feature_names(names)
     return names
 
 

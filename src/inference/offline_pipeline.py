@@ -29,7 +29,7 @@ For group tests (sparse_vs_dense, irregular_gaps):
   both models were trained on the same full dataset.
 """
 from __future__ import annotations
-import csv, time
+import csv, time, gc
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -42,7 +42,7 @@ from sklearn.metrics import (roc_auc_score, average_precision_score,
 from src.models.mamba_encoder import MambaEncoder
 from src.models.xgboost_head  import XGBMortality, XGBLos
 from src.training.stage2_train import extract_features, apply_stage2_transforms
-from src.data.temporal_samples import _window_and_pad
+from src.data.temporal_samples import _window_and_pad, build_event_driven_samples
 
 
 @dataclass
@@ -56,7 +56,18 @@ class BenchResult:
     extra:    dict  = field(default_factory=dict)
 
 
-def _flat(sequences: dict, ids: list) -> np.ndarray:
+def _collect_mem() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _flat(
+    sequences: dict,
+    ids: list,
+    include_last: bool = True,
+    include_miss_rate: bool = True,
+) -> np.ndarray:
     rows = []
     for s in ids:
         seq, _, mask = sequences[s][:3]
@@ -68,12 +79,23 @@ def _flat(sequences: dict, ids: list) -> np.ndarray:
             if obs is not None:
                 obs = obs[~np.isnan(obs)]
             if obs is not None and len(obs) > 0:
-                r.extend([float(np.nanmean(obs)),
-                           float(np.nanstd(obs)) if len(obs) > 1 else 0.0,
-                           float(np.nanmin(obs)), float(np.nanmax(obs)),
-                           float(obs[-1]), float(1.0 - m.mean())])
+                feats = [
+                    float(np.nanmean(obs)),
+                    float(np.nanstd(obs)) if len(obs) > 1 else 0.0,
+                    float(np.nanmin(obs)),
+                    float(np.nanmax(obs)),
+                ]
+                if include_last:
+                    feats.append(float(obs[-1]))
+                if include_miss_rate:
+                    feats.append(float(1.0 - m.mean()))
             else:
-                r.extend([np.nan, np.nan, np.nan, np.nan, np.nan, 1.0])
+                feats = [np.nan, np.nan, np.nan, np.nan]
+                if include_last:
+                    feats.append(np.nan)
+                if include_miss_rate:
+                    feats.append(1.0)
+            r.extend(feats)
         rows.append(r)
     return np.array(rows, dtype=np.float32)
 
@@ -148,7 +170,12 @@ def _make_loaders_from_seqs(seqs_tr, seqs_va, seqs_te,
                              y_mort, y_los, static_features, batch_size,
                              shuffle_train: bool = False):
     from src.data.dataset import make_loaders
-    merged = {**seqs_tr, **seqs_va, **seqs_te}
+    
+    # OOM-SAFE: inline updates to avoid massive memory duplication
+    merged = seqs_tr
+    merged.update(seqs_va)
+    merged.update(seqs_te)
+
     tr_l, va_l, te_l = make_loaders(merged, y_mort, y_los, tr_ids, va_ids, te_ids,
                                      static_features=static_features, batch_size=batch_size,
                                      shuffle_train=shuffle_train)
@@ -220,6 +247,73 @@ def _build_fixed_cut_dataset(
     return out_seq, out_m, out_l, out_static, out_meta
 
 
+def _prefix_labels_from_outcomes(
+    stay_ids: list,
+    stay_outcomes: dict,
+) -> tuple[dict, dict]:
+    mort = {}
+    los = {}
+    for sid in stay_ids:
+        meta = stay_outcomes.get(sid, {})
+        mort[sid] = int(meta.get("death_offset_days") is not None)
+        los[sid] = float(meta.get("icu_los_days", 0.0))
+    return mort, los
+
+
+def _build_full_event_stream_dataset(
+    sequences: dict,
+    stay_ids: list,
+    stay_outcomes: dict,
+    static_features: Optional[dict],
+    obs_window_hours: float = 4.0,
+    mortality_horizon_hours: float = 24.0,
+    los_target: str = "remaining",
+    max_samples_per_stay: int = 64,
+) -> dict:
+    """
+    Rebuild the original stay-level data into the raw event-stream formulation:
+    one sample after every valid measurement timestamp, with no per-stay anchor
+    downsampling.
+
+    This is the closest offline match to:
+      - one or more variables can change at an event
+      - delta_t between events is irregular
+      - a prediction is made after every event update
+    """
+    if not sequences or not stay_ids:
+        return {
+            "sequences": {},
+            "mortality_labels": {},
+            "los_labels": {},
+            "los_remaining_labels": None,
+            "static_features": {} if static_features is not None else None,
+            "sample_to_stay": {},
+            "sample_metadata": {},
+        }
+
+    stay_ids = [sid for sid in stay_ids if sid in sequences]
+    seq_subset = {sid: sequences[sid] for sid in stay_ids}
+    static_subset = None
+    if static_features is not None:
+        static_subset = {sid: static_features[sid] for sid in stay_ids if sid in static_features}
+    mort_labels, los_labels = _prefix_labels_from_outcomes(stay_ids, stay_outcomes)
+    return build_event_driven_samples(
+        sequences=seq_subset,
+        mortality_labels=mort_labels,
+        los_labels=los_labels,
+        stay_outcomes=stay_outcomes,
+        static_features=static_subset,
+        anchor_mode="event",
+        min_elapsed_hours=0.0,
+        step_hours=1.0,
+        min_anchor_gap_minutes=0.0,
+        obs_window_hours=obs_window_hours,
+        mortality_horizon_hours=mortality_horizon_hours,
+        los_target=los_target,
+        max_samples_per_stay=max_samples_per_stay,
+    )
+
+
 class OfflineBenchmark:
     def __init__(self, sequences, mortality_labels, los_labels,
                  train_ids, val_ids, test_ids, d_input, d_model=128,
@@ -244,9 +338,9 @@ class OfflineBenchmark:
         self.tr_loader, self.va_loader, self.te_loader = make_loaders(
             sequences, mortality_labels, los_labels, train_ids, val_ids, test_ids,
             static_features=static_features, batch_size=batch_size)
-        self.X_tr = _flat(sequences, train_ids)
-        self.X_va = _flat(sequences, val_ids)
-        self.X_te = _flat(sequences, test_ids)
+        self.X_tr = None
+        self.X_va = None
+        self.X_te = None
         self.ym_tr = np.array([mortality_labels[s] for s in train_ids])
         self.ym_va = np.array([mortality_labels[s] for s in val_ids])
         self.ym_te = np.array([mortality_labels[s] for s in test_ids])
@@ -266,6 +360,13 @@ class OfflineBenchmark:
         self.prefix_obs_window_hours = float(prefix_obs_window_hours)
         self.prefix_mortality_horizon_hours = float(prefix_mortality_horizon_hours)
         self.prefix_los_target = str(prefix_los_target)
+
+    def _ensure_flat_cache(self):
+        if self.X_tr is None:
+            self.X_tr = _flat(self.seqs, self.tr)
+            self.X_va = _flat(self.seqs, self.va)
+            self.X_te = _flat(self.seqs, self.te)
+            _collect_mem()
 
     def _result(self, name, ym, yp_m, yl=None, yp_l=None, t=0.0, extra=None):
         return BenchResult(
@@ -389,12 +490,30 @@ class OfflineBenchmark:
                             xgb_l.predict_days(F_l), extra={"table": "full"})
 
     def eval_xgb_flat(self):
+        self._ensure_flat_cache()
         t0 = time.perf_counter()
         xgb_m, xgb_l = _train_xgb_flat(self.X_tr, self.ym_tr, self.yl_tr,
                                          self.X_va, self.ym_va, self.yl_va)
         return self._result("XGBoost-flat", self.ym_te, xgb_m.predict(self.X_te),
                             self.yl_te, xgb_l.predict_days(self.X_te),
                             time.perf_counter()-t0, extra={"table": "full"})
+
+    def eval_xgb_flat_no_last_miss(self):
+        X_tr = _flat(self.seqs, self.tr, include_last=False, include_miss_rate=False)
+        X_va = _flat(self.seqs, self.va, include_last=False, include_miss_rate=False)
+        X_te = _flat(self.seqs, self.te, include_last=False, include_miss_rate=False)
+        t0 = time.perf_counter()
+        xgb_m, xgb_l = _train_xgb_flat(X_tr, self.ym_tr, self.yl_tr,
+                                         X_va, self.ym_va, self.yl_va)
+        return self._result(
+            "XGB-flat [-last,-miss]",
+            self.ym_te,
+            xgb_m.predict(X_te),
+            self.yl_te,
+            xgb_l.predict_days(X_te),
+            time.perf_counter() - t0,
+            extra={"table": "full"},
+        )
 
     # ------------------------------------------------------------------
     # TABLE 2 — Irregular time series (FAIR: both retrain at each window)
@@ -529,6 +648,7 @@ class OfflineBenchmark:
         enc = _load_encoder(self.enc_path, self.d_input, self.d_model,
                             self.enc_kw, self.device)
         xgb_m, xgb_l = _load_xgb(self.mort_path, self.los_path)
+        self._ensure_flat_cache()
         m_flat, l_flat = _train_xgb_flat(
             self.X_tr, self.ym_tr, self.yl_tr,
             self.X_va, self.ym_va, self.yl_va,
@@ -583,6 +703,7 @@ class OfflineBenchmark:
         enc = _load_encoder(self.enc_path, self.d_input, self.d_model,
                             self.enc_kw, self.device)
         xgb_m, xgb_l = _load_xgb(self.mort_path, self.los_path)
+        self._ensure_flat_cache()
         m_flat, l_flat = _train_xgb_flat(
             self.X_tr, self.ym_tr, self.yl_tr,
             self.X_va, self.ym_va, self.yl_va,
@@ -598,6 +719,177 @@ class OfflineBenchmark:
             test_name="event_replay",
             group_name="all_events",
         )
+
+    def eval_event_stream_replay(self, max_samples_list=[32, 16, 8, 4]):
+        """
+        Rebuild the original stay-level stream into all event anchors.
+        Implements a step-down approach for RAM safety: tries max_samples sequentially.
+        """
+        if not self.prefix_sequences or not self.prefix_tr or not self.prefix_va or not self.prefix_te:
+            print("\n  [Raw Event Stream] skipped: missing base stay sequences/splits")
+            return []
+        if not self.prefix_stay_outcomes:
+            print("\n  [Raw Event Stream] skipped: missing stay outcomes")
+            return []
+
+        for max_s in max_samples_list:
+            import gc
+            gc.collect()
+            print(f"\n  [Raw Event Stream] Attempting dynamic replay cap: max_samples_per_stay = {max_s}")
+            try:
+                tr_ds = _build_full_event_stream_dataset(
+                    self.prefix_sequences, self.prefix_tr, self.prefix_stay_outcomes,
+                    self.prefix_static,
+                    obs_window_hours=self.prefix_obs_window_hours,
+                    mortality_horizon_hours=self.prefix_mortality_horizon_hours,
+                    los_target=self.prefix_los_target,
+                    max_samples_per_stay=max_s,
+                )
+                va_ds = _build_full_event_stream_dataset(
+                    self.prefix_sequences, self.prefix_va, self.prefix_stay_outcomes,
+                    self.prefix_static,
+                    obs_window_hours=self.prefix_obs_window_hours,
+                    mortality_horizon_hours=self.prefix_mortality_horizon_hours,
+                    los_target=self.prefix_los_target,
+                    max_samples_per_stay=max_s,
+                )
+                te_ds = _build_full_event_stream_dataset(
+                    self.prefix_sequences, self.prefix_te, self.prefix_stay_outcomes,
+                    self.prefix_static,
+                    obs_window_hours=self.prefix_obs_window_hours,
+                    mortality_horizon_hours=self.prefix_mortality_horizon_hours,
+                    los_target=self.prefix_los_target,
+                    max_samples_per_stay=max_s,
+                )
+
+                tr_ids = sorted(tr_ds["sequences"])
+                va_ids = sorted(va_ds["sequences"])
+                te_ids = sorted(te_ds["sequences"])
+                if min(len(tr_ids), len(va_ids), len(te_ids)) == 0:
+                    print("\n  [Raw Event Stream] skipped: empty split after event rebuild")
+                    return []
+
+                ym_tr = np.array([tr_ds["mortality_labels"][s] for s in tr_ids], dtype=np.int32)
+                ym_va = np.array([va_ds["mortality_labels"][s] for s in va_ids], dtype=np.int32)
+                ym_te = np.array([te_ds["mortality_labels"][s] for s in te_ids], dtype=np.int32)
+                if len(np.unique(ym_tr)) < 2 or len(np.unique(ym_va)) < 2 or len(np.unique(ym_te)) < 2:
+                    print("\n  [Raw Event Stream] skipped: single-class split")
+                    return []
+
+                # OOM-SAFE: inline update to prevent RAM spikes
+                merged_y_m = tr_ds["mortality_labels"]
+                merged_y_m.update(va_ds["mortality_labels"])
+                merged_y_m.update(te_ds["mortality_labels"])
+
+                merged_y_l = tr_ds["los_labels"]
+                merged_y_l.update(va_ds["los_labels"])
+                merged_y_l.update(te_ds["los_labels"])
+
+                merged_static = {}
+                for ds in (tr_ds, va_ds, te_ds):
+                    if ds.get("static_features"):
+                        merged_static.update(ds["static_features"])
+                merged_static = merged_static or None
+                te_meta = te_ds.get("sample_metadata", {})
+
+                enc = _load_encoder(self.enc_path, self.d_input, self.d_model, self.enc_kw, self.device)
+                tr_l, va_l, te_l = _make_loaders_from_seqs(
+                    tr_ds["sequences"], va_ds["sequences"], te_ds["sequences"],
+                    tr_ids, va_ids, te_ids,
+                    merged_y_m, merged_y_l,
+                    merged_static, self.batch_sz,
+                    shuffle_train=False,
+                )
+                F_tr, ym_tr_e, yl_tr = extract_features(enc, tr_l, self.device)
+                F_va, ym_va_e, yl_va = extract_features(enc, va_l, self.device)
+                F_te, ym_te_e, yl_te = extract_features(enc, te_l, self.device)
+
+                xgb_m = XGBMortality()
+                xgb_l = XGBLos()
+                t0 = time.perf_counter()
+                xgb_m.fit(F_tr, ym_tr_e, F_va, ym_va_e)
+                xgb_l.fit(F_tr, yl_tr, F_va, yl_va)
+                train_s_mb = time.perf_counter() - t0
+                yp_mb = xgb_m.predict(F_te)
+                yp_los = xgb_l.predict_days(F_te)
+                del tr_l, va_l, te_l, enc, F_tr, F_va, F_te
+                _collect_mem()
+
+                merged_seqs = tr_ds["sequences"]
+                X_tr = _flat(merged_seqs, tr_ids)
+                X_va = _flat(merged_seqs, va_ids)
+                X_te = _flat(merged_seqs, te_ids)
+                yl_tr_flat = np.array([merged_y_l[s] for s in tr_ids], dtype=np.float32)
+                yl_va_flat = np.array([merged_y_l[s] for s in va_ids], dtype=np.float32)
+                yl_te_flat = np.array([merged_y_l[s] for s in te_ids], dtype=np.float32)
+                t1 = time.perf_counter()
+                m_flat, l_flat = _train_xgb_flat(X_tr, ym_tr, yl_tr_flat, X_va, ym_va, yl_va_flat)
+                train_s_flat = time.perf_counter() - t1
+                yp_flat = m_flat.predict(X_te)
+                yp_los_flat = l_flat.predict_days(X_te)
+                del X_tr, X_va, X_te, m_flat, l_flat
+                _collect_mem()
+
+                X_tr_ab = _flat(merged_seqs, tr_ids, include_last=False, include_miss_rate=False)
+                X_va_ab = _flat(merged_seqs, va_ids, include_last=False, include_miss_rate=False)
+                X_te_ab = _flat(merged_seqs, te_ids, include_last=False, include_miss_rate=False)
+                t2 = time.perf_counter()
+                m_flat_ab, l_flat_ab = _train_xgb_flat(
+                    X_tr_ab, ym_tr, yl_tr_flat,
+                    X_va_ab, ym_va, yl_va_flat,
+                )
+                train_s_flat_ab = time.perf_counter() - t2
+                yp_flat_ab = m_flat_ab.predict(X_te_ab)
+                yp_los_flat_ab = l_flat_ab.predict_days(X_te_ab)
+                del X_tr_ab, X_va_ab, X_te_ab, m_flat_ab, l_flat_ab
+                _collect_mem()
+
+                avg_ts = float(np.mean([
+                    te_meta[s]["n_timestamps"] for s in te_ids
+                ])) if te_ids and te_meta else 0.0
+                avg_gap = float(np.mean([
+                    te_meta[s]["gap_std_s"] for s in te_ids
+                ])) if te_ids and te_meta else 0.0
+
+                print("\n  [Raw Event Stream] — all event anchors from original stay stream")
+                print(f"  train={len(tr_ids):,}  val={len(va_ids):,}  test={len(te_ids):,}")
+                print(f"  avg n_timestamps={avg_ts:.2f}  avg gap std={avg_gap/60.0:.2f} min")
+
+                extra = {
+                    "table": "irregular",
+                    "test": "event_stream",
+                    "group": "all_event_anchors",
+                    "n": len(te_ids),
+                    "n_ts_avg": avg_ts,
+                    "avg_gap_std_s": avg_gap,
+                }
+                return [
+                    self._result(
+                        "MaBoost [raw event stream]", ym_te_e, yp_mb, yl_te, yp_los,
+                        t=train_s_mb, extra=dict(extra),
+                    ),
+                    self._result(
+                        "XGB-flat [raw event stream]", ym_te, yp_flat, yl_te_flat, yp_los_flat,
+                        t=train_s_flat, extra=dict(extra),
+                    ),
+                    self._result(
+                        "XGB-flat [-last,-miss] [raw event stream]",
+                        ym_te, yp_flat_ab, yl_te_flat, yp_los_flat_ab,
+                        t=train_s_flat_ab, extra=dict(extra),
+                    ),
+                ]
+            except MemoryError as e:
+                print(f"    [RAM Guard] Failed at max_samples={max_s} ({e}). Stepping down...")
+                if 'tr_ds' in locals(): del tr_ds
+                if 'va_ds' in locals(): del va_ds
+                if 'te_ds' in locals(): del te_ds
+                if 'merged_y_m' in locals(): del merged_y_m
+                if 'merged_y_l' in locals(): del merged_y_l
+                import gc; gc.collect()
+                continue
+                
+        print("  [Raw Event Stream] Skipped: Failed to allocate even at lowest safety cap (4).")
+        return []
 
     def eval_event_horizons(self, horizons=[6.0, 12.0, 24.0]):
         """
@@ -670,6 +962,7 @@ class OfflineBenchmark:
         enc = _load_encoder(self.enc_path, self.d_input, self.d_model,
                             self.enc_kw, self.device)
         xgb_m, xgb_l = _load_xgb(self.mort_path, self.los_path)
+        self._ensure_flat_cache()
         m_flat, l_flat = _train_xgb_flat(
             self.X_tr, self.ym_tr, self.yl_tr,
             self.X_va, self.ym_va, self.yl_va,
@@ -959,13 +1252,17 @@ class OfflineBenchmark:
         skip = skip or []; results = []
         print("\n" + "="*62 + "\n  TABLE 1 — Full Timestep\n" + "="*62)
         for name, fn in [("MaBoost (ours)", self.eval_maboost),
-                          ("XGBoost-flat",   self.eval_xgb_flat)]:
+                          ("XGBoost-flat",   self.eval_xgb_flat),
+                          ("XGB-flat [-last,-miss]", self.eval_xgb_flat_no_last_miss)]:
             if name in skip: continue
             print(f"\n[Benchmark] {name} ...")
-            try: results.append(fn())
+            try:
+                results.append(fn())
+                _collect_mem()
             except Exception as e: print(f"  ERROR: {e}")
         print("\n" + "="*62 + "\n  TABLE 2 — Irregular Time Series\n" + "="*62)
-        for name, fn in [("event_replay",      self.eval_event_replay),
+        for name, fn in [("event_stream",      self.eval_event_stream_replay),
+                          ("event_replay",      self.eval_event_replay),
                           ("fixed48_prefix",     self.eval_fixed48_prefix),
                           ("event_progression", self.eval_event_progression),
                           ("event_horizons",    self.eval_event_horizons),
@@ -974,7 +1271,9 @@ class OfflineBenchmark:
                           ("rolling_prediction", self.eval_rolling_prediction),
                           ("irregular_gaps",     self.eval_irregular_gaps)]:
             if name in skip: continue
-            try: results.extend(fn())
+            try:
+                results.extend(fn())
+                _collect_mem()
             except Exception as e: print(f"\n  ERROR {name}: {e}")
         return results
 
@@ -995,6 +1294,7 @@ class OfflineBenchmark:
         if not irregular: return
 
         type_labels = {
+            "event_stream": "Raw Event Stream Replay (all event anchors)",
             "event_replay": "Event Replay (same event split/format)",
             "prefix_fixed48": "Fixed48 Prefix (4h->48h) — FAIR retrain",
             "event_progression": "Event-Anchor Progression (elapsed bins)",

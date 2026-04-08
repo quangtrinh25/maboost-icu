@@ -13,6 +13,8 @@ All function names and signatures unchanged.
 """
 from __future__ import annotations
 import copy
+import json
+import datetime
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +47,12 @@ class FocalLoss(nn.Module):
 def log_cosh_loss(pred, target):
     d = pred - target
     return torch.mean(d + F.softplus(-2.0 * d) - np.log(2.0))
+
+
+def distill_bce_loss(student_logits, teacher_prob):
+    student_prob = torch.softmax(student_logits.float(), dim=-1)[:, 1].clamp(1e-6, 1.0 - 1e-6)
+    teacher_prob = teacher_prob.float().clamp(1e-6, 1.0 - 1e-6)
+    return F.binary_cross_entropy(student_prob, teacher_prob)
 
 
 # ---------------------------------------------------------------------------
@@ -120,8 +128,9 @@ def _eval_metrics(model: DualHeadMamba, loader: DataLoader, device: str) -> dict
     for batch in loader:
         x, tau, mask = (batch[i].to(device) for i in range(3))
         # IMPORTANT: Stage 1 saves only model.encoder.state_dict(), not the
-        # temporary static branch or prediction heads. Checkpoint selection must
-        # therefore score encoder quality directly, without x_static.
+        # temporary Stage-1 task heads. Validation therefore keeps the same
+        # Stage-2-like feature path but zero-fills static inputs, so checkpoint
+        # selection stays focused on encoder-derived features.
         logits, _    = model(x, tau, mask, x_static=None)
         probs.append(torch.softmax(logits.float(), -1)[:, 1].cpu())
         labels.append(batch[-2].cpu())
@@ -218,9 +227,12 @@ def train_stage1(
     aux_weight:   float = 0.1,
     aux_held_rate: float = 0.2,
     remaining_los_weight: float = 0.3,
+    distill_mort_weight: float = 0.0,
+    distill_los_weight: float = 0.0,
     trend_stop_window: int = 8,
     trend_stop_delta: float = 0.01,
     selection_metric: str = "auroc",
+    ignore_static_inputs: bool = False,
 ) -> DualHeadMamba:
     Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
     ckpt  = Path(ckpt_dir) / "encoder_best.pth"
@@ -274,13 +286,16 @@ def train_stage1(
 
     use_event_tokens = bool(getattr(model.encoder, "event_token_mode", False))
     use_aux = aux_weight > 0.0 and not use_event_tokens
+    use_distill = distill_mort_weight > 0.0 or distill_los_weight > 0.0
     selection_metric = str(selection_metric).lower().strip()
     if selection_metric not in {"auroc", "auprc"}:
         selection_metric = "auroc"
 
     print(f"[Stage 1] float32 | mixup={use_mixup} | oversample={oversample_pos} | γ={focal_gamma} | "
           f"warmup={warmup_frac:.0%} | nan_hooks=ON | "
+          f"static_in={'OFF' if ignore_static_inputs else 'ON'} | "
           f"aux_loss={'OFF(event_tokens)' if (aux_weight > 0.0 and use_event_tokens) else ('ON w=' + str(aux_weight) if use_aux else 'OFF')} | "
+          f"distill={'ON' if use_distill else 'OFF'} | "
           f"select={selection_metric.upper()}")
 
     ema      = ModelEMA(model, decay=ema_decay)
@@ -292,33 +307,49 @@ def train_stage1(
     for ep in range(1, epochs + 1):
         model.train()
         ep_loss = ep_lm = ep_ll = ep_aux = ep_grad = 0.0
+        ep_dm = ep_dl = 0.0
         ep_lr = 0.0
         n_ok = n_skip = 0
 
         for batch in train_loader:
             x, tau, mask = (batch[i].to(device) for i in range(3))
-            has_static = len(batch) in (6, 7)
-            has_rem = len(batch) in (6, 7) and model.enable_remaining_head
-            if len(batch) == 7:
-                x_static = batch[3].to(device)
-                y_los_rem = batch[4].to(device)
-                y_mort = batch[5].to(device)
-                y_los = batch[6].to(device)
-            elif len(batch) == 6 and has_static:
-                x_static = batch[3].to(device)
-                y_los_rem = None
-                y_mort = batch[4].to(device)
-                y_los = batch[5].to(device)
-            elif len(batch) == 6:
-                x_static = None
-                y_los_rem = batch[3].to(device)
-                y_mort = batch[4].to(device)
-                y_los = batch[5].to(device)
+            has_static = len(batch) >= 6 and hasattr(batch[3], "dim") and batch[3].dim() > 1
+            x_static = batch[3].to(device) if has_static else None
+            t_mort = None
+            t_los = None
+            if has_static:
+                if len(batch) == 9:
+                    y_los_rem = batch[4].to(device)
+                    t_mort = batch[5].to(device)
+                    t_los = batch[6].to(device)
+                elif len(batch) == 8:
+                    y_los_rem = None
+                    t_mort = batch[4].to(device)
+                    t_los = batch[5].to(device)
+                elif len(batch) == 7:
+                    y_los_rem = batch[4].to(device)
+                else:
+                    y_los_rem = None
             else:
+                if len(batch) == 8:
+                    y_los_rem = batch[3].to(device)
+                    t_mort = batch[4].to(device)
+                    t_los = batch[5].to(device)
+                elif len(batch) == 7:
+                    y_los_rem = None
+                    t_mort = batch[3].to(device)
+                    t_los = batch[4].to(device)
+                elif len(batch) == 6:
+                    y_los_rem = batch[3].to(device)
+                else:
+                    y_los_rem = None
+            y_mort = batch[-2].to(device)
+            y_los = batch[-1].to(device)
+
+            if ignore_static_inputs:
+                # Stage 1 only persists the encoder. Zero-filling static inputs keeps
+                # the pretraining objective aligned with encoder-only checkpointing.
                 x_static = None
-                y_los_rem = None
-                y_mort = batch[-2].to(device)
-                y_los = batch[-1].to(device)
 
             if use_mixup:
                 x, tau, mask, y_mort, y_los, x_static = mixup_batch(
@@ -326,6 +357,8 @@ def train_stage1(
                     x_static=x_static, alpha=mixup_alpha,
                 )
                 y_los_rem = None
+                t_mort = None
+                t_los = None
 
             opt.zero_grad(set_to_none=True)
 
@@ -341,6 +374,14 @@ def train_stage1(
             loss_m   = focal(logits, y_mort)
             loss_l   = log_cosh_loss(pred_los, torch.log1p(y_los))
             loss     = loss_m + loss_weight * loss_l
+            if t_mort is not None and distill_mort_weight > 0.0:
+                loss_dm = distill_bce_loss(logits, t_mort)
+                loss = loss + distill_mort_weight * loss_dm
+                ep_dm += loss_dm.item()
+            if t_los is not None and distill_los_weight > 0.0:
+                loss_dl = log_cosh_loss(pred_los, torch.log1p(t_los))
+                loss = loss + distill_los_weight * loss_dl
+                ep_dl += loss_dl.item()
             if pred_los_rem is not None and y_los_rem is not None:
                 pred_los_rem = pred_los_rem.clamp(-8.0, 8.0)
                 loss_lr = log_cosh_loss(pred_los_rem, torch.log1p(y_los_rem))
@@ -398,10 +439,27 @@ def train_stage1(
         nb = max(n_ok, 1)
         aux_str = f" aux={ep_aux/nb:.4f}" if use_aux else ""
         lr_str = f" rem={ep_lr/nb:.4f}" if model.enable_remaining_head else ""
+        dist_str = ""
+        if use_distill:
+            dist_str = f" dist_m={ep_dm/nb:.4f} dist_l={ep_dl/nb:.4f}"
+
+        # Update monitor tracking file
+        try:
+            _prog = Path(ckpt_dir).parent / "results" / "pipeline_progress.json"
+            if _prog.exists():
+                _pdata = json.loads(_prog.read_text())
+                _pdata["epoch"] = ep
+                _pdata["epoch_total"] = epochs
+                _pdata["auroc"] = auroc
+                _pdata["message"] = f"AUPRC={auprc:.4f}"
+                _prog.write_text(json.dumps(_pdata, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
         print(
             f"  ep {ep:3d}/{epochs} | "
             f"loss={ep_loss/nb:.4f} "
-            f"(m={ep_lm/nb:.4f} l={ep_ll/nb:.4f}{lr_str}{aux_str}) | "
+            f"(m={ep_lm/nb:.4f} l={ep_ll/nb:.4f}{lr_str}{aux_str}{dist_str}) | "
             f"grad={ep_grad/nb:.3f} | AUROC={auroc:.4f} | AUPRC={auprc:.4f}"
             + (f" [{n_skip} skip]" if n_skip else "")
         )

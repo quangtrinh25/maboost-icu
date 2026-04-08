@@ -61,18 +61,27 @@ class MaBoostDataset(Dataset):
         los_labels:       Dict,
         stay_ids:         List,
         los_remaining_labels: Optional[Dict] = None,
+        teacher_mortality_probs: Optional[Dict] = None,
+        teacher_los_preds: Optional[Dict] = None,
         static_features:  Optional[Dict] = None,
         seq_mean:         Optional[np.ndarray] = None,
         seq_std:          Optional[np.ndarray] = None,
+        is_train:         bool = False,
+        use_dynamic_drop: bool = False,
     ):
         self.seqs   = sequences
         self.mort   = mortality_labels
         self.los    = los_labels
         self.los_rem = los_remaining_labels
+        self.teacher_mort = teacher_mortality_probs
+        self.teacher_los = teacher_los_preds
         self.ids    = stay_ids
         self.static = static_features
         self.mean   = seq_mean
         self.std    = seq_std
+        self.is_train = is_train
+        self.use_dynamic_drop = use_dynamic_drop
+        self._diagnostic_printed = False
 
     def __len__(self):
         return len(self.ids)
@@ -85,6 +94,21 @@ class MaBoostDataset(Dataset):
         x   = seq.copy().astype(np.float32)
         tau = tau.copy().astype(np.float32)
         m   = mask.copy().astype(np.float32)
+
+        # Dynamic Causal Drop (Targeting early prediction resilience)
+        # Controlled by use_dynamic_drop, NOT is_train — so benchmark
+        # can disable augmentation while still shuffling.
+        if self.use_dynamic_drop and np.random.rand() > 0.5:
+            v_idx = np.where(m.sum(axis=1) > 0)[0]
+            if len(v_idx) > 1:
+                # Randomly pick a cut point representing 'current time'
+                cut_idx = np.random.choice(v_idx)
+                
+                # Alternate between Prefix tracking (early_6h) and Sliding Window (raw_event_stream=4h)
+                obs_win = 4.0 if np.random.rand() > 0.5 else 999.0
+                
+                from src.data.temporal_samples import _window_and_pad
+                x, tau, m = _window_and_pad(x, tau, m, cut_idx, obs_window_hours=obs_win)
 
         # 1. Sanitise tau — NaN/inf in tau causes ZOH gate to explode
         tau = np.nan_to_num(tau, nan=60.0, posinf=3600.0, neginf=1.0)
@@ -116,6 +140,18 @@ class MaBoostDataset(Dataset):
             y_los_rem = torch.tensor(
                 max(float(self.los_rem[sid]), 0.0), dtype=torch.float32
             )
+        t_mort = None
+        if self.teacher_mort is not None and sid in self.teacher_mort:
+            t_mort = torch.tensor(
+                float(np.clip(self.teacher_mort[sid], 1e-6, 1.0 - 1e-6)),
+                dtype=torch.float32,
+            )
+        t_los = None
+        if self.teacher_los is not None and sid in self.teacher_los:
+            t_los = torch.tensor(
+                max(float(self.teacher_los[sid]), 0.0), dtype=torch.float32
+            )
+        has_teacher = t_mort is not None and t_los is not None
 
         if self.static is not None:
             xs = torch.from_numpy(
@@ -124,11 +160,19 @@ class MaBoostDataset(Dataset):
                 ).astype(np.float32)
             ).float()
             if y_los_rem is not None:
+                if has_teacher:
+                    return x_t, tau_t, mask_t, xs, y_los_rem, t_mort, t_los, y_mort, y_los
                 return x_t, tau_t, mask_t, xs, y_los_rem, y_mort, y_los
+            if has_teacher:
+                return x_t, tau_t, mask_t, xs, t_mort, t_los, y_mort, y_los
             return x_t, tau_t, mask_t, xs, y_mort, y_los
 
         if y_los_rem is not None:
+            if has_teacher:
+                return x_t, tau_t, mask_t, y_los_rem, t_mort, t_los, y_mort, y_los
             return x_t, tau_t, mask_t, y_los_rem, y_mort, y_los
+        if has_teacher:
+            return x_t, tau_t, mask_t, t_mort, t_los, y_mort, y_los
         return x_t, tau_t, mask_t, y_mort, y_los
 
     # ------------------------------------------------------------------
@@ -188,11 +232,15 @@ def make_loaders(
     test_ids,
     static_features = None,
     los_remaining_labels = None,
+    teacher_mortality_probs = None,
+    teacher_los_preds = None,
     batch_size: int = 64,
     num_workers: int = 0,
     oversample_pos: bool = False,
     shuffle_train: bool = True,
     device: str = "cpu",
+    force_stats = None,
+    use_dynamic_drop: bool = False,
 ) -> Tuple[DataLoader, DataLoader, DataLoader]:
     """
     Build train / val / test DataLoaders.
@@ -201,21 +249,40 @@ def make_loaders(
     oversample_pos: WeightedRandomSampler to balance training set.
     Note: do not use oversample_pos together with Focal Loss class weights
     as this double-compensates for class imbalance.
+
+    force_stats: if provided, dict {"mean": ndarray, "std": ndarray} that
+                 overrides local norm computation. Use to inject global stats
+                 from Stage 1 training into benchmark evaluation.
+    use_dynamic_drop: if True, enables Dynamic Causal Drop augmentation on
+                      the training set. Decoupled from shuffle_train so that
+                      benchmarks can shuffle without augmenting.
     """
-    mean, std = MaBoostDataset.norm_stats(sequences, train_ids)
+    if force_stats is not None:
+        mean = force_stats["mean"]
+        std  = force_stats["std"]
+        _norm_source = "Global (injected)"
+    else:
+        mean, std = MaBoostDataset.norm_stats(sequences, train_ids)
+        _norm_source = "Local (computed from train_ids)"
 
     kw = dict(
         sequences        = sequences,
         mortality_labels = mortality_labels,
         los_labels       = los_labels,
         los_remaining_labels = los_remaining_labels,
+        teacher_mortality_probs = teacher_mortality_probs,
+        teacher_los_preds = teacher_los_preds,
         static_features  = static_features,
         seq_mean         = mean,
         seq_std          = std,
     )
     pin = device != "cpu"
 
-    train_ds = MaBoostDataset(**kw, stay_ids=train_ids)
+    _drop_mode = "Dynamic" if use_dynamic_drop else "Fixed"
+    train_ds = MaBoostDataset(
+        stay_ids=train_ids, is_train=True,
+        use_dynamic_drop=use_dynamic_drop, **kw,
+    )
 
     if oversample_pos:
         labels  = np.array([int(train_ds.mort[sid]) for sid in train_ids])
@@ -248,6 +315,7 @@ def make_loaders(
 
     print(
         f"[Dataset] train={len(train_ids):,}  val={len(val_ids):,}  "
-        f"test={len(test_ids):,}  (norm from train only, no leakage)"
+        f"test={len(test_ids):,}  | "
+        f"Drop: {_drop_mode} | Norm: {_norm_source}"
     )
     return tr, va, te

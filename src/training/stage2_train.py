@@ -79,6 +79,46 @@ def load_frozen_encoder(ckpt: str, d_input: int, d_model: int = 128,
     return enc
 
 
+def _enable_stage2_aligned_params(enc: MambaEncoder) -> int:
+    """
+    Selectively unfreeze the parts of the encoder that directly shape the
+    Stage-2 feature space, while keeping the heavy Mamba SSM weights frozen.
+    """
+    for p in enc.parameters():
+        p.requires_grad = False
+
+    trainable = []
+    modules = [
+        enc.imputer,
+        enc.sci,
+        enc.cci,
+        enc.input_proj,
+        enc.t_emb,
+        enc.t_fuse,
+        enc.pool,
+    ]
+    if getattr(enc, "event_token_mode", False):
+        modules.extend([
+            enc.event_value_proj,
+            enc.event_var_emb,
+            enc.event_fuse,
+        ])
+
+    for module in modules:
+        for p in module.parameters():
+            p.requires_grad = True
+            trainable.append(p)
+
+    for layer in enc.layers:
+        layer.log_decay.requires_grad = True
+        trainable.append(layer.log_decay)
+        for p in layer.norm.parameters():
+            p.requires_grad = True
+            trainable.append(p)
+
+    return int(sum(p.numel() for p in trainable))
+
+
 def _finetune_encoder(
     enc: MambaEncoder,
     loader: DataLoader,
@@ -87,40 +127,121 @@ def _finetune_encoder(
     lr: float = 1e-5,
 ) -> MambaEncoder:
     """
-    OPT-7: Lightly fine-tune encoder on Stage 2 labels.
-    Uses only mortality supervision (binary cross-entropy) with very low lr.
-    Unfreeze all parameters, train for `epochs` epochs, re-freeze.
+    OPT-7: Lightly fine-tune encoder on the actual Stage-2 feature contract.
+
+    Old behavior:
+      enc(x, tau, mask) -> temporary linear mortality head
+
+    New behavior:
+      enc.extract_features(x, tau, mask) -> [z_multi ; raw_stats ; static]
+      -> temporary proxy heads for mortality and LOS
+
+    This keeps the fine-tune target aligned with the frozen-feature space that
+    Stage 2 will actually hand to XGBoost. Only the time-sensitive / projection
+    submodules are unfrozen; the heavy Mamba SSM weights stay frozen.
     """
     from torch.nn import functional as F_nn
 
     enc = enc.to(device)
-    for p in enc.parameters():
-        p.requires_grad = True
+    n_trainable = _enable_stage2_aligned_params(enc)
 
-    # Lightweight classification head (not saved, only used for fine-tuning)
-    d = enc.pool.proj.out_features
-    head = nn.Linear(d, 2).to(device)
-    opt  = torch.optim.AdamW(
-        list(enc.parameters()) + list(head.parameters()),
-        lr=lr, weight_decay=1e-5
+    try:
+        sample_batch = next(iter(loader))
+    except StopIteration:
+        print("  [Enc finetune] skipped: empty loader")
+        enc.eval()
+        return enc
+
+    x0 = sample_batch[0].to(device)
+    tau0 = sample_batch[1].to(device)
+    mask0 = sample_batch[2].to(device)
+    has_static = len(sample_batch) >= 6 and hasattr(sample_batch[3], "dim") and sample_batch[3].dim() > 1
+    static_dim = int(sample_batch[3].shape[1]) if has_static else 0
+
+    with torch.no_grad():
+        z0, raw0 = enc.extract_features(x0, tau0, mask0)
+    feat_dim = int(z0.shape[1] + raw0.shape[1] + static_dim)
+    hidden_dim = min(max(int(z0.shape[1] // 2), 256), 512)
+
+    def _proxy_head(out_dim: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Linear(feat_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, out_dim),
+        )
+
+    mort_head = _proxy_head(2).to(device)
+    los_head = _proxy_head(1).to(device)
+
+    opt = torch.optim.AdamW(
+        [p for p in enc.parameters() if p.requires_grad]
+        + list(mort_head.parameters())
+        + list(los_head.parameters()),
+        lr=lr,
+        weight_decay=1e-5,
     )
 
-    print(f"  [Enc finetune] {epochs} epochs lr={lr}")
+    print(
+        f"  [Enc finetune] {epochs} epochs lr={lr} | "
+        f"trainable={n_trainable:,} encoder params | feat_dim={feat_dim}"
+    )
     for ep in range(epochs):
-        enc.train(); head.train()
-        total_loss = 0.0; n_ok = 0
+        enc.train()
+        mort_head.train()
+        los_head.train()
+        total_loss = 0.0
+        total_m = 0.0
+        total_l = 0.0
+        n_ok = 0
         for batch in loader:
             x, tau, mask = batch[0].to(device), batch[1].to(device), batch[2].to(device)
+            x_static = batch[3].to(device) if has_static else None
             y_mort = batch[-2].to(device)
+            y_los = batch[-1].to(device)
             opt.zero_grad(set_to_none=True)
-            z = enc(x, tau, mask)
-            loss = F_nn.cross_entropy(head(z), y_mort)
+
+            z_multi, raw_stats = enc.extract_features(x, tau, mask)
+            parts = [
+                z_multi,
+                torch.nan_to_num(raw_stats, nan=0.0, posinf=0.0, neginf=0.0),
+            ]
+            if has_static:
+                if x_static is None:
+                    x_static = z_multi.new_zeros((z_multi.shape[0], static_dim))
+                else:
+                    x_static = torch.nan_to_num(x_static, nan=0.0, posinf=0.0, neginf=0.0)
+                parts.append(x_static)
+
+            feat = torch.cat(parts, dim=-1)
+            logits = mort_head(feat)
+            pred_los = los_head(feat).squeeze(-1)
+            loss_m = F_nn.cross_entropy(logits, y_mort)
+            loss_l = F_nn.smooth_l1_loss(pred_los, torch.log1p(y_los))
+            loss = loss_m + 0.5 * loss_l
+
             if torch.isfinite(loss):
                 loss.backward()
-                nn.utils.clip_grad_norm_(list(enc.parameters()) + list(head.parameters()), 1.0)
+                for p in enc.parameters():
+                    if p.grad is not None:
+                        torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                nn.utils.clip_grad_norm_(
+                    [p for p in enc.parameters() if p.requires_grad]
+                    + list(mort_head.parameters())
+                    + list(los_head.parameters()),
+                    1.0,
+                )
                 opt.step()
-                total_loss += loss.item(); n_ok += 1
-        print(f"    ep {ep+1}/{epochs} loss={total_loss/max(n_ok,1):.4f}")
+                total_loss += loss.item()
+                total_m += loss_m.item()
+                total_l += loss_l.item()
+                n_ok += 1
+        print(
+            f"    ep {ep+1}/{epochs} "
+            f"loss={total_loss/max(n_ok,1):.4f} "
+            f"(mort={total_m/max(n_ok,1):.4f} los={total_l/max(n_ok,1):.4f})"
+        )
 
     enc.eval()
     for p in enc.parameters():

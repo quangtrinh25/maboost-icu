@@ -142,6 +142,15 @@ class MaBoostOnlinePipeline:
         return F_base
 
     # ------------------------------------------------------------------
+    def prepare_update_features(self, F_base: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        F_mort = F_base
+        F_los = F_base
+        if self.ckpt_dir:
+            F_mort = apply_stage2_transforms(F_base, self.ckpt_dir, for_mortality=True)
+            F_los = apply_stage2_transforms(F_base, self.ckpt_dir, for_mortality=False)
+        return F_mort, F_los
+
+    # ------------------------------------------------------------------
     def predict(self, stay_id: str, x_new: np.ndarray,
                 tau_new: float, x_static: np.ndarray) -> Dict:
         """
@@ -153,11 +162,7 @@ class MaBoostOnlinePipeline:
         XGBoost train trên 1010-dim → crash hoặc garbage predictions.
         """
         F_base = self._build_feature_vector(stay_id, x_new, tau_new, x_static)
-        F_mort = F_base
-        F_los = F_base
-        if self.ckpt_dir:
-            F_mort = apply_stage2_transforms(F_base, self.ckpt_dir, for_mortality=True)
-            F_los = apply_stage2_transforms(F_base, self.ckpt_dir, for_mortality=False)
+        F_mort, F_los = self.prepare_update_features(F_base)
 
         mort_risk = float(self.xgb_mort.predict(F_mort)[0])
         los_days  = float(self.xgb_los.predict_days(F_los)[0])
@@ -175,11 +180,7 @@ class MaBoostOnlinePipeline:
         used by XGBoost. Useful for online incremental update buffers.
         """
         F_base = self._build_feature_vector(stay_id, x_new, tau_new, x_static)
-        F_mort = F_base
-        F_los = F_base
-        if self.ckpt_dir:
-            F_mort = apply_stage2_transforms(F_base, self.ckpt_dir, for_mortality=True)
-            F_los = apply_stage2_transforms(F_base, self.ckpt_dir, for_mortality=False)
+        F_mort, F_los = self.prepare_update_features(F_base)
         mort_risk = float(self.xgb_mort.predict(F_mort)[0])
         los_days  = float(self.xgb_los.predict_days(F_los)[0])
         level     = next(lbl for thr, lbl in self._RISK if mort_risk < thr)

@@ -228,6 +228,15 @@ def build_event_driven_samples(
         if not cutpoints:
             continue
 
+        # Check memory every 100 stays to avoid OOM killer
+        try:
+            import psutil
+            if len(out_seq) % 500 == 0:
+                if psutil.virtual_memory().percent > 85.0:
+                    raise MemoryError("Internal safety stop > 85% RAM")
+        except ImportError:
+            pass
+
         if max_samples_per_stay > 0 and len(cutpoints) > max_samples_per_stay:
             keep = np.linspace(0, len(cutpoints) - 1, max_samples_per_stay).round().astype(int)
             cutpoints = [cutpoints[k] for k in keep]
